@@ -267,15 +267,17 @@ int main(void) {
         return ok ? 0 : 1;
     }
 
-    // 存量自启任务若为旧版（无 --tray），静默升级为托盘启动，避免下次开机弹主窗口
-
-    if (!start_hidden) startup_ensure_tray_args();
-
     HANDLE mutex = util_single_instance("Local\\LANTimeSync");
     if (!mutex) {
         fprintf(stderr, "another instance is already running.\n");
         WSACleanup(); return 1;
     }
+
+    // 存量自启任务若为旧版（无 --tray），静默升级为托盘启动，避免下次开机弹主窗口。
+    // 必须在互斥体之后：任务文件不可读时这个调用会 shell out 到 schtasks
+    // （耗时数秒），放在锁前会让同时冷启动的每个实例都 fork 一遍 schtasks，
+    // 而只有活下来的那一个才有资格去改自启任务。
+    if (!start_hidden) startup_ensure_tray_args();
 
     int rc = run_as_tray(start_hidden);
 
