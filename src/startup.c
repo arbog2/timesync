@@ -1,6 +1,7 @@
 #define UNICODE
 #define _UNICODE
 #include "startup.h"
+#include "util.h"
 #include <windows.h>
 #include <shellapi.h>
 #include <stdio.h>
@@ -16,52 +17,12 @@
 // 新版本改用计划任务（ONLOGON + /RL HIGHEST）实现带提权的静默自启。
 // 自启任务必须带 --tray，启动时只进托盘，不弹主窗口。
 
-// --- 兼容层：32 位进程在 64 位 Win7 上访问 System32 会被重定向到 SysWOW64 ---
-static bool is_wow64(void) {
-    BOOL wow = FALSE;
-    typedef BOOL (WINAPI *PFN_IsWow64)(HANDLE, PBOOL);
-    HMODULE h = GetModuleHandleW(L"kernel32.dll");
-    if (h) {
-        PFN_IsWow64 p = (PFN_IsWow64)GetProcAddress(h, "IsWow64Process");
-        if (p) p(GetCurrentProcess(), &wow);
-    }
-    return wow != FALSE;
-}
-static void get_windows_dir(WCHAR *out, size_t cap) {
-    UINT n = GetWindowsDirectoryW(out, (DWORD)cap);
-    if (n==0 || n>=cap) wcscpy(out, L"C:\\Windows");
-}
-static void build_sys_path(const WCHAR *leaf, WCHAR *out, size_t cap) {
-    // leaf 例如 L"schtasks.exe" 或 L"Tasks\\LANTimeSync"
-    WCHAR win[MAX_PATH]=L"";
-    get_windows_dir(win, MAX_PATH);
-    // 32 位跑在 64 位系统上：System32 被重定向到 SysWOW64，需改走 Sysnative
-    bool useSysnative = false;
-    if (is_wow64()) {
-        // 探针：Sysnative 是否存在（仅 32 位可见）
-        WCHAR probe[MAX_PATH]=L"";
-        _snwprintf(probe, MAX_PATH, L"%s\\Sysnative\\schtasks.exe", win);
-        probe[MAX_PATH-1]=L'\0';
-        DWORD a = GetFileAttributesW(probe);
-        if (a != INVALID_FILE_ATTRIBUTES || GetLastError() != ERROR_FILE_NOT_FOUND) useSysnative = true;
-        // 探针失败也不影响，Sysnative 拼接本身无副作用，64 位系统上不存在会回退到 System32
-        // 但 Win7 x86 纯 32 位系统没有 Sysnative，需确认
-        if (useSysnative) {
-            WCHAR test[MAX_PATH]=L"";
-            _snwprintf(test, MAX_PATH, L"%s\\Sysnative", win);
-            test[MAX_PATH-1]=L'\0';
-            if (GetFileAttributesW(test)==INVALID_FILE_ATTRIBUTES && GetLastError()==ERROR_PATH_NOT_FOUND) useSysnative = false;
-        }
-    }
-    // 用 bool 标志而不是比较字符串字面量地址（后者依赖编译器的字面量合并，
-    // MSVC /W4 会报 C4130）
-    const WCHAR *sys = useSysnative ? L"Sysnative" : L"System32";
-    _snwprintf(out, cap, L"%s\\%s\\%s", win, sys, leaf);
-    out[cap-1]=L'\0';
-}
-static void get_schtasks_path(WCHAR *out, size_t cap) { build_sys_path(L"schtasks.exe", out, cap); }
-static void get_task_file_path(WCHAR *out, size_t cap) { build_sys_path(L"Tasks\\LANTimeSync", out, cap); }
-static void get_task_tray_file_path(WCHAR *out, size_t cap) { build_sys_path(L"Tasks\\LANTimeSyncTray", out, cap); }
+// WOW64 探测与 %WINDIR%\System32(换 Sysnative) 路径拼接统一由 util 提供，
+// 此前此处与 ntpserver.c 各存一份几乎相同的实现。
+
+static void get_schtasks_path(WCHAR *out, size_t cap) { util_build_sys_bin_path(L"schtasks.exe", out, cap); }
+static void get_task_file_path(WCHAR *out, size_t cap) { util_build_sys_bin_path(L"Tasks\\LANTimeSync", out, cap); }
+static void get_task_tray_file_path(WCHAR *out, size_t cap) { util_build_sys_bin_path(L"Tasks\\LANTimeSyncTray", out, cap); }
 
 static bool is_win7(void) {
     /* RtlGetVersion 返回真实版本号，不受 manifest 的 supportedOS 声明影响
@@ -124,14 +85,7 @@ static bool reg_create_fallback(void) {
 }
 
 static bool is_elevated(void) {
-    HANDLE tok = NULL;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) return false;
-    TOKEN_ELEVATION el; DWORD ret = 0;
-    BOOL ok = FALSE;
-    if (GetTokenInformation(tok, TokenElevation, &el, sizeof(el), &ret))
-        ok = el.TokenIsElevated;
-    CloseHandle(tok);
-    return ok != FALSE;
+    return util_is_elevated();
 }
 
 static DWORD run_hidden_and_wait(WCHAR *cmdline, DWORD timeoutMs) {
@@ -163,7 +117,7 @@ static bool task_exists_fast(void) {
         // 再查一次 Sysnative/Tasks 目录下是否有旧任务，兼容 32/64 交叉
         // 若探针路径不同，再试一次硬编码 System32，避免 Sysnative 探针误判
         WCHAR alt[MAX_PATH]=L"";
-        WCHAR win[MAX_PATH]=L""; get_windows_dir(win, MAX_PATH);
+        WCHAR win[MAX_PATH]=L""; util_get_windows_dir(win, MAX_PATH);
         _snwprintf(alt, MAX_PATH, L"%s\\System32\\Tasks\\LANTimeSync", win);
         alt[MAX_PATH-1]=L'\0';
         if (wcscmp(alt, taskFile)!=0) {
@@ -379,7 +333,7 @@ bool startup_is_enabled(void) {
     if (GetFileAttributesW(trayFile)!=INVALID_FILE_ATTRIBUTES) return true;
     // 兼容 Win7 上被重定向的 System32 路径残留
     {
-        WCHAR win[MAX_PATH]=L""; get_windows_dir(win, MAX_PATH);
+        WCHAR win[MAX_PATH]=L""; util_get_windows_dir(win, MAX_PATH);
         WCHAR alt[MAX_PATH]=L""; _snwprintf(alt, MAX_PATH, L"%s\\System32\\Tasks\\LANTimeSync", win);
         alt[MAX_PATH-1]=L'\0';
         WCHAR cur[MAX_PATH]=L""; get_task_file_path(cur, MAX_PATH);

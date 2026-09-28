@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
+#include <wchar.h>
 
 /* ------------------------------------------------------------------ */
 /* logging                                                            */
@@ -131,6 +132,64 @@ HANDLE util_single_instance(const char* name) {
         return NULL;
     }
     return h; /* keep open for process lifetime */
+}
+
+/* ------------------------------------------------------------------ */
+/* privilege / architecture probes                                    */
+/* ------------------------------------------------------------------ */
+
+/* IsWow64Process 在 Win7 起由 kernel32 导出，但为了不把它变成静态导入项
+   （它只在本模块用一次），这里照旧走 GetProcAddress。 */
+bool util_is_wow64(void) {
+    BOOL wow = FALSE;
+    HMODULE h = GetModuleHandleW(L"kernel32.dll");
+    if (h) {
+        typedef BOOL (WINAPI *PFN_IsWow64)(HANDLE, PBOOL);
+        PFN_IsWow64 p = (PFN_IsWow64)GetProcAddress(h, "IsWow64Process");
+        if (p) p(GetCurrentProcess(), &wow);
+    }
+    return wow != FALSE;
+}
+
+bool util_is_elevated(void) {
+    HANDLE tok = NULL;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) return false;
+    TOKEN_ELEVATION el;
+    DWORD ret = 0;
+    BOOL elevated = FALSE;
+    if (GetTokenInformation(tok, TokenElevation, &el, sizeof(el), &ret))
+        elevated = el.TokenIsElevated;
+    CloseHandle(tok);
+    return elevated != FALSE;
+}
+
+void util_get_windows_dir(WCHAR* out, size_t cap) {
+    if (!out || cap == 0) return;
+    UINT n = GetWindowsDirectoryW(out, (DWORD)cap);
+    if (n == 0 || n >= cap) wcscpy(out, L"C:\\Windows");
+}
+
+void util_build_sys_bin_path(const WCHAR* leaf, WCHAR* out, size_t cap) {
+    if (!out || cap == 0) return;
+    WCHAR win[MAX_PATH] = L"";
+    util_get_windows_dir(win, MAX_PATH);
+
+    /* 只有 WOW64 时才可能需要 Sysnative。探针失败（属性读不到）时按"没有
+       Sysnative"处理即可：32 位纯 32 位系统上拼接出 Sysnative 路径会得到
+       ERROR_PATH_NOT_FOUND，两处失败分支都会收敛到 System32。 */
+    bool useSysnative = false;
+    if (util_is_wow64()) {
+        WCHAR probe[MAX_PATH] = L"";
+        _snwprintf(probe, MAX_PATH, L"%s\\Sysnative", win);
+        probe[MAX_PATH - 1] = L'\0';
+        if (!(GetFileAttributesW(probe) == INVALID_FILE_ATTRIBUTES &&
+              GetLastError() == ERROR_PATH_NOT_FOUND))
+            useSysnative = true;
+    }
+    /* 用 bool 标志而不是比较字符串字面量地址（后者依赖字面量合并，/W4 报 C4130） */
+    const WCHAR* sys = useSysnative ? L"Sysnative" : L"System32";
+    _snwprintf(out, cap, L"%s\\%s\\%s", win, sys, leaf);
+    out[cap - 1] = L'\0';
 }
 
 /* ------------------------------------------------------------------ */

@@ -1,6 +1,7 @@
 #define UNICODE
 #define _UNICODE
 #include "ntpserver.h"
+#include "util.h"
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
@@ -9,57 +10,11 @@
 
 #define W32TIME_SVC L"W32Time"
 
-static bool is_wow64_local(void) {
-    BOOL wow = FALSE;
-    HMODULE h = GetModuleHandleW(L"kernel32.dll");
-    if (h) {
-        typedef BOOL (WINAPI *PFN_IsWow64)(HANDLE, PBOOL);
-        PFN_IsWow64 p = (PFN_IsWow64)GetProcAddress(h, "IsWow64Process");
-        if (p) p(GetCurrentProcess(), &wow);
-    }
-    return wow != FALSE;
-}
-static void get_windows_dir_local(WCHAR *out, size_t cap) {
-    UINT n = GetWindowsDirectoryW(out, (DWORD)cap);
-    if (n==0 || n>=cap) wcscpy(out, L"C:\\Windows");
-}
-static void build_sys_bin_path_local(const WCHAR *leaf, WCHAR *out, size_t cap) {
-    WCHAR win[MAX_PATH]=L"";
-    get_windows_dir_local(win, MAX_PATH);
-    bool useSysnative = false;
-    if (is_wow64_local()) {
-        WCHAR probe[MAX_PATH]=L"";
-        _snwprintf(probe, MAX_PATH, L"%s\\Sysnative\\%s", win, leaf);
-        probe[MAX_PATH-1]=L'\0';
-        DWORD a = GetFileAttributesW(probe);
-        if (a != INVALID_FILE_ATTRIBUTES || GetLastError() != ERROR_FILE_NOT_FOUND) useSysnative = true;
-        else {
-            WCHAR test[MAX_PATH]=L"";
-            _snwprintf(test, MAX_PATH, L"%s\\Sysnative", win);
-            test[MAX_PATH-1]=L'\0';
-            if (!(GetFileAttributesW(test)==INVALID_FILE_ATTRIBUTES && GetLastError()==ERROR_PATH_NOT_FOUND)) useSysnative = true;
-        }
-        if (useSysnative) {
-            WCHAR t2[MAX_PATH]=L"";
-            _snwprintf(t2, MAX_PATH, L"%s\\Sysnative", win);
-            t2[MAX_PATH-1]=L'\0';
-            if (GetFileAttributesW(t2)==INVALID_FILE_ATTRIBUTES && GetLastError()==ERROR_PATH_NOT_FOUND) useSysnative = false;
-        }
-    }
-    // 用 bool 标志而不是比较字符串字面量地址（后者依赖字面量合并，/W4 报 C4130）
-    const WCHAR *sys = useSysnative ? L"Sysnative" : L"System32";
-    _snwprintf(out, cap, L"%s\\%s\\%s", win, sys, leaf);
-    out[cap-1]=L'\0';
-}
+// WOW64 探测、%WINDIR% 目录与 System32/Sysnative 路径拼接统一由 util 提供，
+// 此前此处与 startup.c 各存一份几乎相同的实现。
 
 static bool is_elevated_impl(void) {
-    HANDLE tok = NULL;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) return false;
-    TOKEN_ELEVATION el; DWORD ret = 0;
-    BOOL ok = FALSE;
-    if (GetTokenInformation(tok, TokenElevation, &el, sizeof(el), &ret)) ok = el.TokenIsElevated;
-    CloseHandle(tok);
-    return ok != FALSE;
+    return util_is_elevated();
 }
 bool ntp_is_elevated(void) { return is_elevated_impl(); }
 
@@ -148,8 +103,8 @@ static bool w32_ensure_auto_start(void) {
     return ok;
 }
 
-static void get_netsh_path_local(WCHAR *out, size_t cap) { build_sys_bin_path_local(L"netsh.exe", out, cap); }
-static void get_w32tm_path_local(WCHAR *out, size_t cap) { build_sys_bin_path_local(L"w32tm.exe", out, cap); }
+static void get_netsh_path_local(WCHAR *out, size_t cap) { util_build_sys_bin_path(L"netsh.exe", out, cap); }
+static void get_w32tm_path_local(WCHAR *out, size_t cap) { util_build_sys_bin_path(L"w32tm.exe", out, cap); }
 
 static bool firewall_has_rule_hidden(void) {
     WCHAR netsh[MAX_PATH]=L""; get_netsh_path_local(netsh, MAX_PATH);

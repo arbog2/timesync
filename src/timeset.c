@@ -29,16 +29,7 @@ bool timeset_enable_priv(void) {
 }
 
 bool timeset_is_elevated(void) {
-    HANDLE tok = NULL;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok))
-        return false;
-    TOKEN_ELEVATION el;
-    DWORD ret = 0;
-    BOOL elevated = FALSE;
-    if (GetTokenInformation(tok, TokenElevation, &el, sizeof(el), &ret))
-        elevated = el.TokenIsElevated;
-    CloseHandle(tok);
-    return elevated != 0;
+    return util_is_elevated();
 }
 
 bool timeset_system_time(int64_t unix_ms) {
