@@ -133,7 +133,13 @@ void task_run(const config_t* cfg, task_state_t* st) {
         if (first) { should_sync = cfg->sync_on_start; first = false; }
         if (now >= next_sync)    should_sync = true;
         if (now >= next_retry)   should_sync = true;
-        if (InterlockedCompareExchange(&g_want_sync, 0, 1) == 1)
+        /* 取出并清除"请求立即同步"标志：InterlockedExchange 读旧值、
+           无条件写 0，返回值非 0 即表示此前有挂起的请求。
+           原先写的是 InterlockedCompareExchange(&g, 0, 1)：它只在旧值
+           等于 1 时才写 0，旧值为 0 时反而写入 1——于是每轮 1 秒的循环
+           都会把标志重新置 1，下一轮立刻又满足条件，语义虽能凑效但
+           意图完全被掩盖。 */
+        if (InterlockedExchange(&g_want_sync, 0) == 1)
             should_sync = true;
 
         if (should_sync) {
