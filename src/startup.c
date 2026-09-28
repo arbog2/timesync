@@ -223,21 +223,15 @@ static bool task_delete_one(const WCHAR *tname) {
     return false;
 }
 static bool task_delete(void) {
-    bool a = task_delete_one(TASK_NAME);
-    bool b = task_delete_one(TASK_TRAY_NAME);
-    // 兼容旧版：主任务删不掉也尝试删托盘任务，至少保证 check 能回落
-    bool ok = a && b;
+    task_delete_one(TASK_NAME);
+    // 兼容旧版：主任务删不掉也照样删托盘任务，至少保证 check 能回落
+    task_delete_one(TASK_TRAY_NAME);
     // 无论如何都清理注册表回退
     reg_remove();
-    if (ok) return true;
-    if (!task_exists_fast()) {
-        // 主任务已不存在，视为成功
-        WCHAR trayFile[MAX_PATH]=L""; get_task_tray_file_path(trayFile, MAX_PATH);
-        if (GetFileAttributesW(trayFile)==INVALID_FILE_ATTRIBUTES) return true;
-        // 托盘任务单独存在也算成功清理了一半，回退查询主任务
-        return true;
-    }
-    return false;
+    // 判据是"自启是否真的没了"，而不是"schtasks 是否逐个返回 0"：
+    // schtasks 删一个不存在的任务会返回 1，按删除返回值判断会把
+    // 已经清干净的状态误报成失败。托盘任务残留也不影响自启主流程。
+    return !startup_is_enabled();
 }
 
 // 为服务模式补一个常驻托盘任务：服务本身跑在 Session 0，桌面永远看不到图标，
@@ -348,22 +342,15 @@ bool startup_is_enabled(void) {
 
 bool startup_set(bool enable) {
     if (enable) {
-        if (task_create()) {
-            return true;
-        }
-        return false;
-    } else {
-        bool ok = task_delete();
-        // 同时清理服务托盘任务
-        tray_task_remove();
-        reg_remove();
-        if (ok) return true;
-        if (!task_exists_fast() && !reg_is_enabled()) {
-            WCHAR trayFile[MAX_PATH]=L""; get_task_tray_file_path(trayFile, MAX_PATH);
-            if (GetFileAttributesW(trayFile)==INVALID_FILE_ATTRIBUTES) return true;
-        }
-        return false;
+        return task_create();
     }
+    task_delete();
+    // 同时清理服务托盘任务与注册表回退
+    tray_task_remove();
+    reg_remove();
+    // task_delete 内部已按"自启是否真的没了"判定过一次，这里以复查结果为准，
+    // 避免托盘任务/注册表残留被报成删除失败。
+    return !startup_is_enabled();
 }
 
 // 供 service.c 在安装/卸载时调用，保持服务与托盘任务的生命周期一致
