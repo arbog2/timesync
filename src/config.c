@@ -75,7 +75,10 @@ static bool parse_kv(const char* line, char* key, size_t kc, char* val, size_t v
     return key[0] != '\0';
 }
 
-/* set integer field; keeps trailing 's'/'ms'/'minutes' modifiers if matched */
+/* set integer field. strtol 会吃掉前导数字并把 end 指向首个非数字字符，
+   所以 "60s" / "2000ms" 这类带单位后缀的值会被解析成 60 / 2000，
+   后缀被静默忽略（不会报错，也不会保留）。
+   各键的合法区间在这里就地钳制，越界的值一律丢弃、保留原值。 */
 static void set_int(int* dst, const char* val, const char* key) {
     char* end;
     long v = strtol(val, &end, 10);
