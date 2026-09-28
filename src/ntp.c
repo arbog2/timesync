@@ -67,8 +67,14 @@ static void build_request(ntp_packet_t* p) {
 static int resolve_host(const char* host, int port, SOCKADDR_IN* out) {
     out->sin_family = AF_INET;
     out->sin_port   = htons((u_short)port);
-    out->sin_addr.s_addr = inet_addr(host);
-    if (out->sin_addr.s_addr != INADDR_NONE)
+
+    /* 用 InetPtonA 而不是 inet_addr：后者对非法输入和合法的
+       255.255.255.255 都返回 INADDR_NONE，调用方无法区分两者，
+       于是广播地址会错误地落到下面的 getaddrinfo 分支（对
+       "255.255.255.255" 而言那是无意义的：目标没有主机名可解析）。
+       InetPtonA 以 1/0 明确表示成功与否。
+       它不接受 "1.2.3" 这类简写，也不做 DNS——这正好由 getaddrinfo 兜底。 */
+    if (InetPtonA(AF_INET, host, &out->sin_addr) == 1)
         return 0;
 
     struct addrinfo hints, *res = NULL;
