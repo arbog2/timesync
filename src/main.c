@@ -18,7 +18,6 @@
 static config_t     g_cfg;
 static char         g_cfgPath[MAX_PATH] = "";
 static task_state_t g_state;
-volatile LONG g_tray_quit = 0;
 
 static void print_usage(void) {
     printf(
@@ -97,7 +96,6 @@ static int run_as_tray(bool start_hidden) {
 
     int rc = window_message_loop(hwnd);
 
-    InterlockedExchange(&g_tray_quit, 1);
     service_set_stopping();
     WaitForSingleObject(th, 4000);
     CloseHandle(th);

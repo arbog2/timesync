@@ -29,7 +29,6 @@ static char          s_cfgPath[MAX_PATH] = "";
 static char          s_exeDir[MAX_PATH] = "";
 static HWND          s_hMain = NULL;
 static HFONT         s_hFont = NULL;
-static HWND          s_edits[16]; // quick refs
 
 #define WM_TRAYICON (WM_APP + 100)
 #define ID_TRAY     1
@@ -37,7 +36,6 @@ static HWND          s_edits[16]; // quick refs
 #define WM_SVC_DONE  (WM_APP + 101)
 #define WM_NTP_DONE  (WM_APP + 102)
 
-static svc_state_t s_lastSvcState = SVC_UNKNOWN;
 static volatile LONG s_svcBusy = 0;
 
 typedef enum { SVC_OP_INSTALL = 1, SVC_OP_UNINSTALL, SVC_OP_START, SVC_OP_STOP } svc_op_t;
@@ -45,7 +43,6 @@ typedef struct { HWND hwnd; svc_op_t op; DWORD result; DWORD err; } svc_job_t;
 
 // ---- 本机时钟服务 (W32Time NTP Server) ----
 static volatile LONG s_ntpBusy = 0;
-static ntp_state_t   s_lastNtpState = NTP_UNKNOWN;
 typedef enum { NTP_OP_ENABLE = 1, NTP_OP_DISABLE, NTP_OP_CHECK } ntp_op_t;
 typedef struct { HWND hwnd; ntp_op_t op; DWORD result; DWORD err; ntp_state_t st; } ntp_job_t;
 
@@ -462,7 +459,6 @@ static void autostart_invalidate(void) { s_autoValid = FALSE; }
 static void refresh_service_status(HWND hwnd) {
     if (InterlockedCompareExchange(&s_svcBusy, 0, 0)) return; // 操作进行中不刷
     svc_state_t st = service_query_state();
-    s_lastSvcState = st;
 
     WCHAR w[128];
     WCHAR hint[256] = L"";
@@ -520,7 +516,6 @@ static void set_ntp_busy(HWND hwnd, BOOL busy) {
 static void refresh_ntp_status(HWND hwnd) {
     if (InterlockedCompareExchange(&s_ntpBusy, 0, 0)) return;
     ntp_state_t st = ntp_query_state();
-    s_lastNtpState = st;
     const char* nameA = ntp_state_name(st);
     WCHAR wName[64]; utf8_to_w(nameA, wName, 64);
     WCHAR w[128];
@@ -912,10 +907,11 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
                     case IDC_BTN_SVC_STOP:      do_svc_stop_gui(hwnd); break;
                     case IDC_BTN_EXIT: {
                         if (auth_is_set() && !auth_prompt_verify(hwnd)) break;
-                        // 真退出
-                        extern void service_set_stopping(void);
-                        extern volatile LONG g_tray_quit;
-                        InterlockedExchange((LONG*)&g_tray_quit, 1);
+                        // 真退出。worker 线程 task_run 的退出条件就是
+                        // service_is_stopping()，而它同时也是 SCM 停止标志，
+                        // 所以这里只需 service_set_stopping()，主线程随后
+                        // DestroyWindow -> PostQuitMessage 结束消息循环，
+                        // main.c 的 run_as_tray 会等 worker 收尾。
                         service_set_stopping();
                         DestroyWindow(hwnd);
                         break;
@@ -943,8 +939,11 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
                     }
                     case IDC_CHECK_AUTOSTART: {
                         BOOL checked = IsDlgButtonChecked(hwnd, IDC_CHECK_AUTOSTART)==BST_CHECKED;
-                        // 服务已安装时不应允许通过 Run 键自启，刷新会置灰，此处防御性再拦一次
-                        if (service_query_state()!=SVC_NOT_INSTALLED && service_query_state()!=SVC_UNKNOWN) {
+                        // 服务已安装时不应允许通过 Run 键/计划任务自启，刷新会置灰，
+                        // 此处防御性再拦一次。service_query_state 每次都要开关一次
+                        // SCM，判两次会白付一份开销，这里只查一次。
+                        svc_state_t st = service_query_state();
+                        if (st != SVC_NOT_INSTALLED && st != SVC_UNKNOWN) {
                             CheckDlgButton(hwnd, IDC_CHECK_AUTOSTART, BST_UNCHECKED);
                             show_info(L"系统服务已安装，无需再设置开机自启动。\n服务本身即为开机自启。", L"提示");
                             break;
