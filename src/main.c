@@ -30,6 +30,7 @@ static void print_usage(void) {
         "  timesync --service          (internal) SCM starts us this way\n"
         "  timesync --once             one sync pass, print result, exit\n"
         "  timesync --config <file>    use an explicit config file\n"
+        "  timesync --result <file>    (with --once) write the result to <file>\n"
         "  timesync --help             this help\n"
         "\n"
         "Config: <ProgramData>\\LANTimeSync\\config.ini or exe-dir config.ini\n"
@@ -104,6 +105,33 @@ static int run_as_tray(bool start_hidden) {
 
 /* ---------------- main ---------------- */
 
+/* ---------------- --once result hand-off ----------------
+   --once 以 /SUBSYSTEM:WINDOWS 链接，没有控制台，printf 的结果在 GUI
+   拉起的提权子进程里没有任何去处。改由子进程把结果落到 --result 指定
+   的文件，父进程（window.c）轮询取回并显示。
+
+   先写 <path>.tmp 再 MoveFileEx 原子改名，与 config_extra.c 的写配置
+   同一套做法：父进程只可能看到完整文件，不会在子进程 fopen 已建、
+   内容未落完的窗口期读到半截数据。 */
+static void write_result_file(const char* path, const task_state_t* st) {
+    if (!path || !path[0]) return;
+    WCHAR wpath[MAX_PATH] = L"", wtmp[MAX_PATH + 8] = L"";
+    if (MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, MAX_PATH) == 0) return;
+    if (_snwprintf(wtmp, MAX_PATH + 7, L"%s.tmp", wpath) < 0) return;
+    wtmp[MAX_PATH + 7] = L'\0';
+
+    FILE* f = NULL;
+    _wfopen_s(&f, wtmp, L"w");   /* 字节模式：UTF-8 原样写出，不加 BOM */
+    if (!f) return;
+    fprintf(f, "ok=%d\n",   st->last_success ? 1 : 0);
+    fprintf(f, "offset=%lld\n", (long long)st->last_offset_ms);
+    fprintf(f, "rtt=%lld\n",    (long long)st->last_rtt_ms);
+    fprintf(f, "error=%s\n",    st->last_error[0] ? st->last_error : "-");
+    fclose(f);
+    if (!MoveFileExW(wtmp, wpath, MOVEFILE_REPLACE_EXISTING))
+        DeleteFileW(wtmp);
+}
+
 int main(void) {
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
@@ -116,6 +144,7 @@ int main(void) {
     LPWSTR* argvW = CommandLineToArgvW(GetCommandLineW(), &nArgs);
     const char* mode = NULL;
     char cfgOverride[MAX_PATH] = "";
+    char resultOverride[MAX_PATH] = "";
     bool delete_cfg = false; /* --temp-config: remove the --config file after load */
     bool start_hidden = false; // --tray / --startup：自启时只进托盘，不弹主窗口
     for (int i = 1; i < nArgs; i++) {
@@ -137,6 +166,10 @@ int main(void) {
         else if (strcmp(b, "--config") == 0 && i + 1 < nArgs) {
             WideCharToMultiByte(CP_UTF8, 0, argvW[++i], -1,
                                 cfgOverride, sizeof(cfgOverride), NULL, NULL);
+        }
+        else if (strcmp(b, "--result") == 0 && i + 1 < nArgs) {
+            WideCharToMultiByte(CP_UTF8, 0, argvW[++i], -1,
+                                resultOverride, sizeof(resultOverride), NULL, NULL);
         }
         else if (strcmp(b, "--temp-config") == 0) delete_cfg = true;
         else if (strcmp(b, "--help") == 0 || strcmp(b, "-h") == 0) {
@@ -263,6 +296,7 @@ int main(void) {
                ok ? "OK" : "FAILED",
                (long long)g_state.last_offset_ms, (long long)g_state.last_rtt_ms,
                g_state.last_error[0] ? g_state.last_error : "-");
+        write_result_file(resultOverride, &g_state);
         WSACleanup();
         return ok ? 0 : 1;
     }

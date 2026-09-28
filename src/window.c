@@ -33,10 +33,22 @@ static HFONT         s_hFont = NULL;
 #define WM_TRAYICON (WM_APP + 100)
 #define ID_TRAY     1
 #define TIMER_STATUS 1
+#define TIMER_ONCE_RESULT 98
+/* 提权 --once 的结果回传：300ms 一轮，最多 100 轮（30s）。
+   UAC 确认 + 子进程启动 + 3 次采样（每轮最长 timeout_ms）远小于这个上限，
+   上限只用来兜住"子进程被拦在别处 / 崩溃"的死等。 */
+#define ONCE_RESULT_MAX_TRIES 100
 #define WM_SVC_DONE  (WM_APP + 101)
 #define WM_NTP_DONE  (WM_APP + 102)
 
 static volatile LONG s_svcBusy = 0;
+
+/* 提权 --once 子进程的结果文件与轮询状态（仅 UI 线程访问） */
+static WCHAR s_onceResult[MAX_PATH] = L"";
+static int   s_onceTries = 0;
+
+/* 状态栏刷新：定义在文件后部，poll_once_result 要用它提前回填界面 */
+static void refresh_status(HWND hwnd);
 
 typedef enum { SVC_OP_INSTALL = 1, SVC_OP_UNINSTALL, SVC_OP_START, SVC_OP_STOP } svc_op_t;
 typedef struct { HWND hwnd; svc_op_t op; DWORD result; DWORD err; } svc_job_t;
@@ -90,6 +102,18 @@ static void show_info(const WCHAR* msg, const WCHAR* title) {
 }
 static void show_err(const WCHAR* msg, const WCHAR* title) {
     MessageBoxW(s_hMain, msg, title, MB_OK | MB_ICONWARNING);
+}
+/* 读一个 UTF-8 文本文件到 buf；文件不存在或读失败时 buf 置空串。
+   结果文件由子进程以字节模式写出，无需转码即可按 UTF-8 解析。 */
+static void wchar_to_utf8_file(const WCHAR* wpath, char* out, size_t cap) {
+    if (!out || cap == 0) return;
+    out[0] = '\0';
+    FILE* f = NULL;
+    _wfopen_s(&f, wpath, L"rb");
+    if (!f) return;
+    size_t n = fread(out, 1, cap - 1, f);
+    out[n] = '\0';
+    fclose(f);
 }
 
 // ---- 文件/目录操作 ----
@@ -262,40 +286,131 @@ static void do_sync_now_gui(HWND hwnd) {
         return;
     }
     // 无权限：用 runas 提权跑 --once。需让子进程用到文本框里的实时地址，
-    // 因此先把当前 s_cfg（含实时 server/port）写入临时配置文件
+    // 因此先把当前 s_cfg（含实时 server/port）写入临时配置文件。
+    // 同步结果由子进程写进 s_onceResult，父进程轮询取回——/SUBSYSTEM:WINDOWS
+    // 的子进程没有控制台，printf 的结果无处可看。
     WCHAR wtmp[MAX_PATH]=L"";
     GetTempPathW(MAX_PATH, wtmp);
     WCHAR wtmpFile[MAX_PATH]=L"";
     GetTempFileNameW(wtmp, L"lts", 0, wtmpFile);
+    WCHAR wresFile[MAX_PATH]=L"";
+    GetTempFileNameW(wtmp, L"ltsres", 0, wresFile);
+    /* GetTempFileName 会先建出一个空文件；子进程是原子改名落地的，
+       留着这个空壳会让父进程立刻误判"结果已就绪"并读到空内容。 */
+    DeleteFileW(wresFile);
+
     /* wide-char write, no ACP/UTF-8 loss; child deletes it via --temp-config */
     bool tmpOk = config_save_w(s_cfg, wtmpFile);
     WCHAR exe[MAX_PATH]=L"";
     GetModuleFileNameW(NULL, exe, MAX_PATH);
-    WCHAR params[700]=L"";
+    WCHAR params[1400]=L"";
     bool paramsOk = true;
     if (tmpOk) {
         /* _snwprintf 截断时返回 -1，会得到一个不完整的 --config 路径，
            提权子进程于是加载不到配置。宁可显式失败也不要静默用错配置。 */
-        if (_snwprintf(params, 700, L"--once --temp-config --config \"%s\"", wtmpFile) < 0) paramsOk = false;
+        if (_snwprintf(params, 1400, L"--once --temp-config --config \"%s\" --result \"%s\"",
+                       wtmpFile, wresFile) < 0) paramsOk = false;
     } else {
         WCHAR wcfg[MAX_PATH]=L""; utf8_to_w(s_cfgPath, wcfg, MAX_PATH);
-        if (wcfg[0]) { if (_snwprintf(params, 700, L"--once --config \"%s\"", wcfg) < 0) paramsOk = false; }
-        else wcscpy(params, L"--once");
+        if (wcfg[0]) { if (_snwprintf(params, 1400, L"--once --config \"%s\" --result \"%s\"", wcfg, wresFile) < 0) paramsOk = false; }
+        else if (_snwprintf(params, 1400, L"--once --result \"%s\"", wresFile) < 0) paramsOk = false;
     }
-    params[699]=L'\0';
+    params[1399]=L'\0';
     if (!paramsOk) {
         /* 子进程不会启动，--temp-config 的自我清理也就不会发生，
            此处自行删除临时配置，避免在 %TEMP% 留下垃圾。 */
         if (tmpOk) DeleteFileW(wtmpFile);
+        DeleteFileW(wresFile);
         MessageBoxW(s_hMain, L"配置路径过长，无法发起提权同步。\n请把程序移到更短的路径后重试。", L"提示", MB_OK | MB_ICONWARNING);
         return;
     }
-    HINSTANCE r = ShellExecuteW(NULL, L"runas", exe, params, NULL, SW_SHOWNORMAL);
+    HINSTANCE r = ShellExecuteW(NULL, L"runas", exe, params, NULL, SW_HIDE);
     if ((INT_PTR)r <= 32) {
-        if ((INT_PTR)r == 42) return; // SE_ERR_CANCELLED
+        if ((INT_PTR)r == 42) {   // SE_ERR_CANCELLED：用户拒了 UAC，什么都不会发生
+            DeleteFileW(wtmpFile);
+            DeleteFileW(wresFile);
+            return;
+        }
+        DeleteFileW(wtmpFile);
+        DeleteFileW(wresFile);
         MessageBoxW(s_hMain, L"需要管理员权限才能修改系统时间。\n请右键以管理员身份运行，或安装为系统服务。", L"提示", MB_OK | MB_ICONINFORMATION);
     } else {
-        SetWindowTextW(GetDlgItem(s_hMain, IDC_LABEL_STATUS), L"已发起提权同步，请在 UAC 后查看结果...");
+        s_onceResult[0] = L'\0';
+        wcscpy(s_onceResult, wresFile);
+        s_onceTries = 0;
+        SetTimer(hwnd, TIMER_ONCE_RESULT, 300, NULL);
+        SetWindowTextW(GetDlgItem(s_hMain, IDC_LABEL_STATUS), L"已发起提权同步，等待结果...");
+    }
+}
+
+/* 轮询提权子进程写回的结果文件。就绪后把 offset/rtt/成功标志灌进共享的
+   task_state，界面上"偏移/RTT/上次同步/状态"随之刷新，并弹一次框把
+   结果直接摆到用户眼前（此前这段信息在非提权路径下彻底无处可看）。 */
+static void poll_once_result(HWND hwnd) {
+    if (!s_onceResult[0]) return;
+    if (++s_onceTries > ONCE_RESULT_MAX_TRIES) {
+        KillTimer(hwnd, TIMER_ONCE_RESULT);
+        DeleteFileW(s_onceResult);
+        s_onceResult[0] = L'\0';
+        SetWindowTextW(GetDlgItem(hwnd, IDC_LABEL_STATUS), L"提权同步超时：未收到子进程结果。");
+        show_err(L"提权同步在 30 秒内没有返回结果。\n请确认 UAC 已通过，必要时查看日志。", L"提权同步");
+        return;
+    }
+
+    HANDLE hf = CreateFileW(s_onceResult, GENERIC_READ, FILE_SHARE_READ, NULL,
+                            OPEN_EXISTING, 0, NULL);
+    if (hf == INVALID_HANDLE_VALUE) return;   // 还没写好
+    CloseHandle(hf);
+
+    // 子进程以原子改名落地，看到的一定是完整文件
+    char buf[1024] = "";
+    wchar_to_utf8_file(s_onceResult, buf, sizeof(buf));
+    KillTimer(hwnd, TIMER_ONCE_RESULT);
+    DeleteFileW(s_onceResult);
+    s_onceResult[0] = L'\0';
+
+    long long off = 0, rtt = 0;
+    int ok = 0;
+    char err[256] = "";
+    char key[32] = "", val[512] = "";
+    char* line = buf;
+    while (line && *line) {
+        char* eol = strpbrk(line, "\r\n");
+        if (eol) *eol = '\0';
+        char* eq = strchr(line, '=');
+        if (eq) {
+            size_t kl = (size_t)(eq - line);
+            if (kl < sizeof(key)) {
+                memcpy(key, line, kl); key[kl] = '\0';
+                strncpy(val, eq + 1, sizeof(val) - 1); val[sizeof(val) - 1] = '\0';
+                if      (strcmp(key, "ok")     == 0) ok  = atoi(val);
+                else if (strcmp(key, "offset") == 0) off = _strtoi64(val, NULL, 10);
+                else if (strcmp(key, "rtt")    == 0) rtt = _strtoi64(val, NULL, 10);
+                else if (strcmp(key, "error")  == 0) { strncpy(err, val, sizeof(err)-1); err[sizeof(err)-1]='\0'; }
+            }
+        }
+        line = eol ? eol + 1 : NULL;
+    }
+    if (strcmp(err, "-") == 0) err[0] = '\0';
+
+    // 灌进共享状态：与 task_sync_once 用同一组原子写，worker 线程并发同步时也不会写坏 64 位量
+    InterlockedExchange64(&s_state->last_offset_ms, off);
+    InterlockedExchange64(&s_state->last_rtt_ms,    rtt);
+    InterlockedExchange64(&s_state->last_sync_sec,  (LONGLONG)time(NULL));
+    InterlockedIncrement(&s_state->synced_count);
+    strncpy(s_state->last_error, err, sizeof(s_state->last_error) - 1);
+    s_state->last_error[sizeof(s_state->last_error) - 1] = '\0';
+    s_state->last_success = ok ? TRUE : FALSE;
+    refresh_status(hwnd);
+
+    WCHAR msg[512], werr[256];
+    utf8_to_w(err[0] ? err : "-", werr, 256);
+    if (ok) {
+        _snwprintf(msg, 512, L"同步成功。\n\n偏移：%lld ms\nRTT：%lld ms", off, rtt);
+        show_info(msg, L"立即同步");
+    } else {
+        _snwprintf(msg, 512, L"同步失败。\n\n原因：%s\n\n偏移：%lld ms\nRTT：%lld ms", werr, off, rtt);
+        show_err(msg, L"立即同步");
     }
 }
 
@@ -717,7 +832,7 @@ static void do_svc_uninstall_gui(HWND hwnd) {
 static void do_svc_start_gui(HWND hwnd) { svc_launch(hwnd, SVC_OP_START); }
 static void do_svc_stop_gui(HWND hwnd)  { svc_launch(hwnd, SVC_OP_STOP); }
 
-// ---- 状态刷新 ----
+/* ---- 状态刷新 ---- */
 static void refresh_status(HWND hwnd){
     if (!s_state) return;
     LONGLONG off = s_state->last_offset_ms;
@@ -969,6 +1084,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         }
         case WM_TIMER:
             if (wp==TIMER_STATUS) { refresh_status(hwnd); refresh_service_status(hwnd); }
+            else if (wp==TIMER_ONCE_RESULT) poll_once_result(hwnd);
             else if (wp==99) { KillTimer(hwnd, 99); refresh_service_status(hwnd); refresh_ntp_status(hwnd); }
             return 0;
         case WM_SVC_DONE: {
@@ -1004,6 +1120,8 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
             return 0;
         case WM_DESTROY:
             KillTimer(hwnd, TIMER_STATUS);
+            KillTimer(hwnd, TIMER_ONCE_RESULT);
+            if (s_onceResult[0]) { DeleteFileW(s_onceResult); s_onceResult[0] = L'\0'; }
             tray_remove(hwnd);
             PostQuitMessage(0);
             return 0;
