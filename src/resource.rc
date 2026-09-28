@@ -1,0 +1,36 @@
+#include <windows.h>
+#include "resource.h"
+
+// Application icon (copied from icon-*.ico to avoid non-ASCII path issues in rc.exe)
+IDI_APP ICON "app.ico"
+
+// DPI-aware manifest: PerMonitorV2 + Common Controls v6
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "app.manifest"
+
+// Version info
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     1,0,0,0
+PRODUCTVERSION  1,0,0,0
+FILEFLAGSMASK   0x3fL
+FILEFLAGS       0x0L
+FILEOS          0x40004L
+FILETYPE        0x1L
+FILESUBTYPE     0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404B0"
+        BEGIN
+            VALUE "CompanyName",      "LANTimeSync"
+            VALUE "FileDescription",  "LAN Time Sync - 局域网时钟同步"
+            VALUE "FileVersion",      "1.0.0.0"
+            VALUE "ProductName",      "LAN Time Sync"
+            VALUE "ProductVersion",   "1.0.0.0"
+            VALUE "OriginalFilename", "timesync.exe"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x804, 1200
+    END
+END
