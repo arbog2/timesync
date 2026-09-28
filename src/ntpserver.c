@@ -106,7 +106,8 @@ static bool w32_ensure_auto_start(void) {
 static void get_netsh_path_local(WCHAR *out, size_t cap) { util_build_sys_bin_path(L"netsh.exe", out, cap); }
 static void get_w32tm_path_local(WCHAR *out, size_t cap) { util_build_sys_bin_path(L"w32tm.exe", out, cap); }
 
-static bool firewall_has_rule_hidden(void) {
+/* 真实探测：拉起 netsh 查询防火墙规则，成本是一次进程创建 + 最长 4s 等待。 */
+static bool firewall_probe_uncached(void) {
     WCHAR netsh[MAX_PATH]=L""; get_netsh_path_local(netsh, MAX_PATH);
     WCHAR cmd[1024];
     _snwprintf(cmd, 1024, L"\"%s\" advfirewall firewall show rule name=\"NTP Server\"", netsh);
@@ -121,6 +122,39 @@ static bool firewall_has_rule_hidden(void) {
     CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
     if (code==0) return true; // 找到规则
     return false;
+}
+
+/* 带缓存的探测。ntp_query_state() 会被 UI 反复调用（窗口创建、每次开/关/检测
+   完成后的刷新），而 netsh 是一次真实的进程创建 + 最多 4s 等待，放在
+   主线程上就是实打实的界面卡顿。缓存 60s 与 autostart_cached() 同思路：
+   防火墙规则不会在一分钟内被别处改动，而增删规则后的那次显式调用会
+   主动作废缓存。 */
+#define FW_CACHE_TTL_MS 60000
+static volatile LONG g_fwValid = 0;
+static volatile LONG g_fwHasRule = 0;
+static volatile LONG g_fwStamp = 0;   /* GetTickCount 快照 */
+
+static bool firewall_has_rule_hidden(void) {
+    DWORD now = GetTickCount();
+    if (InterlockedCompareExchange(&g_fwValid, 0, 0)) {
+        DWORD prev = (DWORD)InterlockedCompareExchange(&g_fwStamp, 0, 0);
+        /* 无符号减法在 32 位 tick 约 49.7 天回绕时依然正确，
+           前提是实际间隔小于 2^31 ms（一律成立）。 */
+        if ((DWORD)(now - prev) < FW_CACHE_TTL_MS)
+            return InterlockedCompareExchange(&g_fwHasRule, 0, 0) != 0;
+    }
+    bool r = firewall_probe_uncached();
+    /* 先写内容再写 valid：valid 即发布标志，读侧看到 valid!=0 时
+       前面两个字段必定已经对本核可见。 */
+    InterlockedExchange(&g_fwStamp, (LONG)now);
+    InterlockedExchange(&g_fwHasRule, r ? 1 : 0);
+    InterlockedExchange(&g_fwValid, 1);
+    return r;
+}
+
+/* 增删防火墙规则后必须作废缓存，否则界面上要等满 60s 才反映出来。 */
+static void firewall_cache_invalidate(void) {
+    InterlockedExchange(&g_fwValid, 0);
 }
 
 ntp_state_t ntp_query_state(void) {
@@ -174,6 +208,7 @@ static bool ensure_firewall_allow(void) {
     WCHAR params[512];
     _snwprintf(params,512,L"advfirewall firewall add rule name=\"NTP Server\" dir=in protocol=udp localport=123 profile=any enable=yes action=allow");
     params[511]=L'\0';
+    firewall_cache_invalidate();
     WCHAR netsh[MAX_PATH]=L""; get_netsh_path_local(netsh, MAX_PATH);
     return run_elevated_or_hidden(netsh, params);
 }
@@ -181,6 +216,7 @@ static void remove_firewall_rule(void) {
     WCHAR params[512];
     _snwprintf(params,512,L"advfirewall firewall delete rule name=\"NTP Server\" protocol=udp localport=123");
     params[511]=L'\0';
+    firewall_cache_invalidate();
     WCHAR netsh[MAX_PATH]=L""; get_netsh_path_local(netsh, MAX_PATH);
     run_elevated_or_hidden(netsh, params);
 }
