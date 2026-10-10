@@ -14,6 +14,7 @@
 #include "timeset.h"
 #include "startup.h"
 #include "ntpserver.h"
+#include "watermark.h"
 
 static config_t     g_cfg;
 static char         g_cfgPath[MAX_PATH] = "";
@@ -55,7 +56,12 @@ void service_on_run(void) {
     }
     while (!service_is_stopping())
         Sleep(200);
-    WaitForSingleObject(th, 5000);
+    /* 一次同步最坏阻塞 3 × 10000ms = 30s，给足 90s 上限（含系统繁忙抖动）。
+     等待期间 service_join_worker 会持续上报 STOP_PENDING 的 CheckPoint，
+     让 SCM 知道我们仍在收尾而不是卡死。 */
+    bool exited = service_join_worker(th, 90000);
+    if (!exited)
+        LOG_ERROR("worker thread still running at stop deadline; exiting anyway");
     CloseHandle(th);
     LOG_INFO("service mode exiting");
 }
@@ -73,6 +79,14 @@ static int run_as_tray(bool start_hidden) {
 
     HANDLE th = CreateThread(NULL, 0, tray_worker, NULL, 0, NULL);
     if (!th) { LOG_ERROR("worker create failed"); return 1; }
+
+    /* 服务已在运行时，GUI 的周期校时全部交给服务，避免两个进程同时
+       SetSystemTime（非管理员身份的那个还会每次失败并在日志里刷 err=5）。
+       手动"立即同步"仍然可用——worker 线程照常起，只关掉定时那部分。 */
+    if (service_query_state() == SVC_RUNNING) {
+        task_set_periodic(false);
+        LOG_INFO("service is running; GUI periodic sync disabled, on-demand sync stays");
+    }
 
     char exeDir[MAX_PATH] = "";
     GetModuleFileNameA(NULL, exeDir, sizeof(exeDir));
@@ -95,10 +109,22 @@ static int run_as_tray(bool start_hidden) {
         UpdateWindow(hwnd);
     }
 
+    /* 桌面水印：独立于主窗口的 topmost 点击穿透窗口，所以主窗口隐藏到
+       托盘后它依然在。放在主窗口之后创建——窗口都没有的情况下，先摆一个
+       水印没有意义。
+       服务模式（Session 0）不走到这里，水印由登录时的托盘伴随进程负责。 */
+    watermark_apply(hInst, &g_cfg);
+
     int rc = window_message_loop(hwnd);
 
+    watermark_destroy();
     service_set_stopping();
-    WaitForSingleObject(th, 4000);
+    /* 窗口已销毁，这里是进程退出前的收尾。worker 通常会在 1 秒内退出
+       （循环里每秒检查一次停止标志）；只有恰好卡在一轮同步里才会更久，
+       那种情况最多等 15 秒——再久就只能放弃，不能把退出无限期拖住。 */
+    DWORD w = WaitForSingleObject(th, 15000);
+    if (w != WAIT_OBJECT_0)
+        LOG_WARN("worker still running at tray exit deadline; exiting anyway");
     CloseHandle(th);
     return rc;
 }
@@ -164,12 +190,18 @@ int main(void) {
         else if (strcmp(b, "--ntp-enable") == 0) mode = "ntp-enable";
         else if (strcmp(b, "--ntp-disable") == 0) mode = "ntp-disable";
         else if (strcmp(b, "--config") == 0 && i + 1 < nArgs) {
-            WideCharToMultiByte(CP_UTF8, 0, argvW[++i], -1,
-                                cfgOverride, sizeof(cfgOverride), NULL, NULL);
+            /* WideCharToMultiByte 空间不足时返回 0 且一个字节都不写。
+               忽略返回值会让超过 MAX_PATH 的 --config 路径静默变成空串，
+               子进程随后回落去读默认配置——用户在文本框里改的服务器地址
+               就这么丢了，而且没有任何报错。显式判失败并留空。 */
+            if (WideCharToMultiByte(CP_UTF8, 0, argvW[++i], -1,
+                                    cfgOverride, sizeof(cfgOverride) - 1, NULL, NULL) == 0)
+                cfgOverride[0] = '\0';
         }
         else if (strcmp(b, "--result") == 0 && i + 1 < nArgs) {
-            WideCharToMultiByte(CP_UTF8, 0, argvW[++i], -1,
-                                resultOverride, sizeof(resultOverride), NULL, NULL);
+            if (WideCharToMultiByte(CP_UTF8, 0, argvW[++i], -1,
+                                    resultOverride, sizeof(resultOverride) - 1, NULL, NULL) == 0)
+                resultOverride[0] = '\0';
         }
         else if (strcmp(b, "--temp-config") == 0) delete_cfg = true;
         else if (strcmp(b, "--help") == 0 || strcmp(b, "-h") == 0) {
@@ -189,6 +221,15 @@ int main(void) {
     if (cfgOverride[0])
         strncpy(cfgPath, cfgOverride, sizeof(cfgPath) - 1);
 
+    /* 在任何写操作之前把 %ProgramData%\LANTimeSync 建好并放开 ACL。
+       日志默认就走这个目录，而开机时服务（SYSTEM）或 /RL HIGHEST 任务
+       可能已经先把日志建好了——那时属主是 SYSTEM，之后登录的标准用户
+       既写不了日志也存不了配置，且失败完全静默（不弹窗、日志里也看不出来）。
+       必须在 util_log_init 之前，否则日志第一次打开就已经失败。
+       不特判 --config：便携安装（配置在 exe 目录）的日志同样默认在 ProgramData，
+       而这个调用是幂等的，代价只是一次 SetNamedSecurityInfo。 */
+    util_ensure_program_dir();
+
     bool loaded = config_load(&cfg, cfgPath);
     if (!loaded) {
         char exe[MAX_PATH] = "";
@@ -205,8 +246,8 @@ int main(void) {
     /* temp config from the GUI runas helper: remove once loaded */
     if (delete_cfg && cfgOverride[0]) {
         WCHAR wdel[MAX_PATH] = L"";
-        MultiByteToWideChar(CP_UTF8, 0, cfgOverride, -1, wdel, MAX_PATH);
-        if (wdel[0]) DeleteFileW(wdel);
+        if (MultiByteToWideChar(CP_UTF8, 0, cfgOverride, -1, wdel, MAX_PATH - 1) > 0)
+            DeleteFileW(wdel);
     }
     strncpy(g_cfgPath, cfgPath, sizeof(g_cfgPath) - 1);
     g_cfg = cfg;
@@ -270,15 +311,23 @@ int main(void) {
     }
     if (mode && strcmp(mode, "ntp-enable") == 0) {
         bool ok = ntp_enable();
-        if (!ok) { DWORD e=GetLastError(); printf("ntp enable failed err=%lu\n", e); }
-        else printf("ntp enabled\n");
-        WSACleanup(); return ok ? 0 : 1;
+        /* 错误码要在任何日志之前取：LOG_ERROR 内部会调 GetLocalTime /
+           EnterCriticalSection 等，可能把 last-error 覆盖掉。 */
+        DWORD err = ok ? 0 : GetLastError();
+        if (!ok) LOG_ERROR("ntp enable failed err=%lu", err);
+        else LOG_INFO("ntp enabled");
+        /* 错误码必须原样带出去：父进程是靠退出码还原失败原因的。
+           这里过去一律 return 1，于是 window.c 里为 1058(服务被禁用)/
+           1053(启动超时)/5(拒绝访问)写的那几条针对性提示永远命中不了，
+           用户只看到"开启失败，错误码 1"。 */
+        WSACleanup(); return ok ? 0 : (int)(err & 0x7FFFFFFFu);
     }
     if (mode && strcmp(mode, "ntp-disable") == 0) {
         bool ok = ntp_disable();
-        if (!ok) { DWORD e=GetLastError(); printf("ntp disable failed err=%lu\n", e); }
-        else printf("ntp disabled\n");
-        WSACleanup(); return ok ? 0 : 1;
+        DWORD err = ok ? 0 : GetLastError();
+        if (!ok) LOG_ERROR("ntp disable failed err=%lu", err);
+        else LOG_INFO("ntp disabled");
+        WSACleanup(); return ok ? 0 : (int)(err & 0x7FFFFFFFu);
     }
     // 提权子进程路径：ntp_enable/ntp_disable 内部会 runas 自身 --ntp-enable，
     // 实际的提权执行分支已经在上面处理；为了避免与托盘互斥，提权后直接执行 do_enable_steps
@@ -303,6 +352,22 @@ int main(void) {
 
     HANDLE mutex = util_single_instance("Local\\LANTimeSync");
     if (!mutex) {
+        /* 自启拉起的第二实例（--tray）只静默退出：开机时主任务与托盘伴随
+           任务可能同时触发，后到的那个若去唤起窗口，会把本该隐藏的主窗口
+           在登录时弹出来。只有用户手工双击（非隐藏启动）才走下面的唤起。 */
+        if (start_hidden) { WSACleanup(); return 0; }
+        /* 单实例已在运行：把它的主窗口带到前台，而不是静默退出。
+           程序以 /SUBSYSTEM:WINDOWS 链接，没有控制台，过去这里的
+           fprintf 用户根本看不到——双击毫无反应，还以为程序坏了。
+           跨完整性（中 -> 高）PostMessage 会被 UIPI 拦截，好在
+           window.c 里已对该消息 ChangeWindowMessageFilter 放行。 */
+        HWND hExist = FindWindowW(L"LANTimeSyncMainWnd", NULL);
+        if (hExist) {
+            UINT msgShow = RegisterWindowMessageW(L"LANTimeSync_ShowWindow");
+            if (msgShow) PostMessageW(hExist, msgShow, 0, 0);
+            /* 已投递唤起消息即算成功：返回 0 */
+            WSACleanup(); return 0;
+        }
         fprintf(stderr, "another instance is already running.\n");
         WSACleanup(); return 1;
     }

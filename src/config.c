@@ -22,14 +22,34 @@ void config_init_defaults(config_t* c) {
     c->log_enabled     = true;
     c->log_level       = LOG_LEVEL_INFO;
     strcpy(c->log_file, "C:\\ProgramData\\LANTimeSync\\time_sync.log");
+
+    /* 桌面水印默认开启：这个功能的用途就是"装完就有"，学生一登录就能看到
+       自己机器的名字，不需要老师逐台去开。不想用的人可以在界面上取消勾选，
+       或把 [watermark] enabled 改成 false。 */
+    c->watermark_enabled    = true;
+    c->watermark_text[0]    = '\0';   /* 空 = 用本机机器名 */
+    c->watermark_size       = 0;      /* 0 = 按屏幕高度自动 */
+    c->watermark_opacity    = 210;    /* 约 82%：够醒目，又不糊住桌面 */
+    c->watermark_background = 0;      /* 纯黄字，不加底衬 */
+    /* 贴桌面而不是置顶：置顶会盖在打开的软件上挡视线，
+       而水印的用途只是"让人知道自己在哪台机器上"。 */
+    c->watermark_on_top     = false;
 }
 
 void config_default_path(char* out, size_t cap) {
-    if (!GetEnvironmentVariableA("ProgramData", out, (DWORD)cap))
-        strncpy(out, "C:\\ProgramData", cap);
-    size_t n = strlen(out);
-    if (n + 2 < cap)
-        _snprintf(out + n, cap - n, "\\LANTimeSync\\config.ini");
+    if (!out || cap == 0) return;
+    out[0] = '\0';
+    /* GetEnvironmentVariableA 在缓冲区不够时返回需要的字节数且不保证
+       写入 NUL，紧接着 strlen(out) 会越界读。显式判返回值。 */
+    DWORD n = GetEnvironmentVariableA("ProgramData", out, (DWORD)cap);
+    if (n == 0 || n >= cap) {
+        strncpy(out, "C:\\ProgramData", cap - 1);
+        out[cap - 1] = '\0';
+    }
+    size_t len = strlen(out);
+    if (len + 2 < cap)
+        _snprintf(out + len, cap - len, "\\LANTimeSync\\config.ini");
+    out[cap - 1] = '\0';
 }
 
 /* remove whitespace from both ends of s in place */
@@ -95,6 +115,12 @@ static void set_int(int* dst, const char* val, const char* key) {
         if (v >= 0) *dst = (int)v;
     } else if (_stricmp(key, "port") == 0) {
         if (v >= 1 && v <= 65535) *dst = (int)v;
+    } else if (_stricmp(key, "watermark_size") == 0) {
+        /* 0 表示自动；上限 400 像素，再大就不是水印而是横幅了 */
+        if (v >= 0 && v <= 400) *dst = (int)v;
+    } else if (_stricmp(key, "watermark_opacity") == 0 ||
+               _stricmp(key, "watermark_background") == 0) {
+        if (v >= 0 && v <= 255) *dst = (int)v;
     } else {
         /* generic untyped */
         *dst = (int)v;
@@ -138,7 +164,16 @@ void config_write_sample(const char* path) {
         "[log]\n"
         "file_enabled = true\n"
         "file_path = \"C:\\\\ProgramData\\\\LANTimeSync\\\\time_sync.log\"\n"
-        "level = \"info\"               ; debug | info | warn | error\n");
+        "level = \"info\"               ; debug | info | warn | error\n"
+        "\n"
+        "[watermark]\n"
+        "; 桌面右上角的黄色水印，内容默认取本机机器名\n"
+        "enabled = true\n"
+        "text =                        ; 留空=机器名；也可写 \"机房A-%%COMPUTERNAME%%\"\n"
+        "size = 0                      ; 字高像素，0=按分辨率自动\n"
+        "opacity = 210                 ; 文字不透明度 0-255\n"
+        "background = 0                ; 文字下深色底衬的不透明度，0=纯文字\n"
+        "layer = desktop               ; desktop=贴桌面(在图标上、所有窗口下)；top=永远置顶\n");
     fclose(f);
 }
 
@@ -224,6 +259,25 @@ bool config_load(config_t* c, const char* path) {
                 else if (_stricmp(val, "info") == 0)  c->log_level = LOG_LEVEL_INFO;
                 else if (_stricmp(val, "warn") == 0)  c->log_level = LOG_LEVEL_WARN;
                 else if (_stricmp(val, "error") == 0) c->log_level = LOG_LEVEL_ERROR;
+            }
+        } else if (strcmp(section, "watermark") == 0) {
+            if (strcmp(key, "enabled") == 0)
+                set_bool(&c->watermark_enabled, val);
+            else if (strcmp(key, "text") == 0) {
+                strncpy(c->watermark_text, val, sizeof(c->watermark_text) - 1);
+                c->watermark_text[sizeof(c->watermark_text) - 1] = '\0';
+            }
+            else if (strcmp(key, "size") == 0)
+                set_int(&c->watermark_size, val, "watermark_size");
+            else if (strcmp(key, "opacity") == 0)
+                set_int(&c->watermark_opacity, val, "watermark_opacity");
+            else if (strcmp(key, "background") == 0)
+                set_int(&c->watermark_background, val, "watermark_background");
+            else if (strcmp(key, "layer") == 0) {
+                /* desktop（默认）贴桌面；top 永远置顶。
+                   认不出的值保持默认，不猜。 */
+                if (_stricmp(val, "desktop") == 0)      c->watermark_on_top = false;
+                else if (_stricmp(val, "top") == 0)     c->watermark_on_top = true;
             }
         }
         /* unknown sections/keys ignored */

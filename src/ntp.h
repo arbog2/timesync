@@ -24,8 +24,15 @@ typedef struct {
    Returns 0 on success with r->ok true. */
 int ntp_sync(const char* host, int port, int timeout_ms, ntp_result_t* r);
 
-/* roundtrip-averaged two-sample sync; returns 0 if any sample ok */
+/* roundtrip-averaged two-sample sync; returns 0 if any sample ok.
+   cancel：可选的中止判断，每个采样之间调用；返回 true 时立刻停止后续采样并
+   返回错误码 -99。传 NULL 表示不可取消。
+   为什么需要它：一次同步最坏 3 × timeout_ms(最大 10s) = 30s，而 SCM 的
+   SERVICE_CONTROL_SHUTDOWN 时限也就 30s 上下。没有采样间的检查点，
+   服务停止/退出时 worker 会被硬杀在一轮同步的中间。 */
+#define NTP_ERR_CANCELLED (-99)
+typedef bool (*ntp_cancel_fn)(void);
 int ntp_sync_best(const char* host, int port, int timeout_ms,
-                  int samples, ntp_result_t* out);
+                  int samples, ntp_cancel_fn cancel, ntp_result_t* out);
 
 #endif /* NTP_H */

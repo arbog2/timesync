@@ -21,6 +21,7 @@
 #include "util.h"
 #include "service.h"
 #include "ntpserver.h"
+#include "watermark.h"
 
 // ---- 内部状态 ----
 static config_t*     s_cfg = NULL;
@@ -33,19 +34,44 @@ static HFONT         s_hFont = NULL;
 #define WM_TRAYICON (WM_APP + 100)
 #define ID_TRAY     1
 #define TIMER_STATUS 1
+#define TIMER_TRAY_RETRY 97
 #define TIMER_ONCE_RESULT 98
+/* 开机自启时计划任务往往跑在 Explorer/任务栏就绪之前，此时 NIM_ADD 直接失败。
+   每 3 秒重试一次直到加上为止；开销只是一次 Shell_NotifyIcon 调用。 */
+#define TRAY_RETRY_MS 3000
 /* 提权 --once 的结果回传：300ms 一轮，最多 100 轮（30s）。
    UAC 确认 + 子进程启动 + 3 次采样（每轮最长 timeout_ms）远小于这个上限，
    上限只用来兜住"子进程被拦在别处 / 崩溃"的死等。 */
 #define ONCE_RESULT_MAX_TRIES 100
 #define WM_SVC_DONE  (WM_APP + 101)
 #define WM_NTP_DONE  (WM_APP + 102)
+#define WM_STARTUP_DONE (WM_APP + 103)
+
+/* 开机自启动的增删在后台线程里做。
+   过去它直接跑在 UI 线程上：startup_set(true/false) 内部要串行调
+   2~3 次 schtasks（每次最长等 8 秒），勾选时还会对 schtasks.exe 弹一次
+   UAC——界面会冻结十几秒，而且用户看到的是"任务计划程序"请求授权而不是
+   本程序，容易误判成中病毒。搬进工作线程后前台不卡，
+   与 svc_launch / ntp_launch 同一套模式。 */
+typedef struct { HWND hwnd; bool enable; DWORD result; DWORD err; } startup_job_t;
+static volatile LONG s_startupBusy = 0;
 
 static volatile LONG s_svcBusy = 0;
 
 /* 提权 --once 子进程的结果文件与轮询状态（仅 UI 线程访问） */
 static WCHAR s_onceResult[MAX_PATH] = L"";
 static int   s_onceTries = 0;
+
+/* 托盘图标状态（仅 UI 线程访问）。
+   s_trayAdded 为 FALSE 期间 TIMER_TRAY_RETRY 会持续重试 NIM_ADD，
+   覆盖"开机时 Explorer 尚未就绪"与"explorer 崩溃重启"两种情形。 */
+static BOOL  s_trayAdded = FALSE;
+static HICON s_hTrayIcon = NULL;
+/* RegisterWindowMessage 的进程内缓存：TaskbarCreated（任务栏重建广播）与
+   LANTimeSync_ShowWindow（单实例唤起）。同一字符串在各进程内返回值相同，
+   可跨进程用作消息 ID。 */
+static UINT  s_msgTaskbarCreated = 0;
+static UINT  s_msgShowWindow = 0;
 
 /* 状态栏刷新：定义在文件后部，poll_once_result 要用它提前回填界面 */
 static void refresh_status(HWND hwnd);
@@ -140,8 +166,18 @@ static void do_view_log_gui(void) {
         show_info(msg, L"提示");
         return;
     }
+    /* 日志开了、文件也在，但当前进程根本没打开成功（最常见是标准用户
+       撞上由 SYSTEM 先建的文件/目录权限）：util_log_init 只能静默降级，
+       这里把这件事说出来，否则用户只会看到日志不更新却完全看不出原因。 */
+    if (s_cfg->log_enabled && !util_log_active()) {
+        WCHAR msg[512];
+        _snwprintf(msg, 512, L"注意：本进程当前无法写入该日志文件（可能是权限或磁盘问题）。\n\n路径：%s", wpath);
+        msg[511] = L'\0';
+        show_info(msg, L"提示");
+    }
     open_path_w(wpath);
 }
+
 static void do_edit_config_gui(void) {
     WCHAR wpath[MAX_PATH]=L"";
     utf8_to_w(s_cfgPath, wpath, MAX_PATH);
@@ -168,6 +204,14 @@ static void do_edit_config_gui(void) {
 }
 LRESULT CALLBACK AboutWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 
+/* "关于"对话框的两个字体句柄。Win32 控件不拥有通过 WM_SETFONT 收到的字体，
+   应用负责销毁——过去这里只借不还，每开一次"关于"泄漏 2 个 GDI 句柄；
+   常驻托盘进程反复打开就会攒到 GDI 上限（约 10000/进程），之后
+   CreateFontW 等分配开始失败，表现为字体回退、绘制异常。
+   句柄在窗口关闭后由 do_about_gui 统一释放，WM_DESTROY 里不再碰
+   （重复 DeleteObject 同一个句柄是未定义行为）。 */
+typedef struct { HFONT plain; HFONT bold; } about_fonts_t;
+
 static void do_about_gui(void) {
     const WCHAR* cls = L"LANTimeSyncAboutDlg";
     UnregisterClassW(cls, GetModuleHandleW(NULL));
@@ -181,6 +225,17 @@ static void do_about_gui(void) {
     InitCommonControlsEx(&icc);
     RegisterClassW(&wc);
 
+    about_fonts_t fonts; memset(&fonts, 0, sizeof(fonts));
+    fonts.plain = CreateFontW(-12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                               DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                               CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
+                               L"Microsoft YaHei UI");
+    if (!fonts.plain) fonts.plain = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    fonts.bold = CreateFontW(-12, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                             CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
+                             L"Microsoft YaHei UI");
+
     int W=380, H=200;
     RECT rc={0,0,W,H}; AdjustWindowRect(&rc, WS_CAPTION|WS_SYSMENU|WS_POPUP, FALSE);
     int winW=rc.right-rc.left, winH=rc.bottom-rc.top;
@@ -188,8 +243,12 @@ static void do_about_gui(void) {
     int sy=(GetSystemMetrics(SM_CYSCREEN)-winH)/2;
     HWND hwnd = CreateWindowExW(0, cls, L"关于 LAN Time Sync",
                                 WS_CAPTION|WS_SYSMENU|WS_POPUP|WS_VISIBLE,
-                                sx, sy, winW, winH, s_hMain, NULL, GetModuleHandleW(NULL), NULL);
-    if (!hwnd) return;
+                                sx, sy, winW, winH, s_hMain, NULL, GetModuleHandleW(NULL), &fonts);
+    if (!hwnd) {
+        if (fonts.plain != GetStockObject(DEFAULT_GUI_FONT)) DeleteObject(fonts.plain);
+        if (fonts.bold && fonts.bold != GetStockObject(DEFAULT_GUI_FONT)) DeleteObject(fonts.bold);
+        return;
+    }
     EnableWindow(s_hMain, FALSE);
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
@@ -202,16 +261,19 @@ static void do_about_gui(void) {
     EnableWindow(s_hMain, TRUE);
     SetForegroundWindow(s_hMain);
     UnregisterClassW(cls, GetModuleHandleW(NULL));
+    /* 窗口已销毁，字体安全释放。GetStockObject 返回的是共享库存对象，不能删 */
+    if (fonts.plain != GetStockObject(DEFAULT_GUI_FONT)) DeleteObject(fonts.plain);
+    if (fonts.bold && fonts.bold != GetStockObject(DEFAULT_GUI_FONT)) DeleteObject(fonts.bold);
 }
 
 LRESULT CALLBACK AboutWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
         case WM_CREATE: {
-            HDC hdc=GetDC(hwnd); int dpi=GetDeviceCaps(hdc,LOGPIXELSY); ReleaseDC(hwnd,hdc);
-            int hfH=-MulDiv(9,dpi,72);
-            HFONT hf=CreateFontW(hfH,0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH|FF_DONTCARE,L"Microsoft YaHei UI");
-            if(!hf) hf=(HFONT)GetStockObject(DEFAULT_GUI_FONT);
-            HFONT hfBold=CreateFontW(hfH,0,0,0,FW_BOLD,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH|FF_DONTCARE,L"Microsoft YaHei UI");
+            CREATESTRUCTW* cs=(CREATESTRUCTW*)lp;
+            /* 字体由 do_about_gui 创建并随窗口关闭释放；这里只借用不销毁 */
+            about_fonts_t* fonts = (about_fonts_t*)cs->lpCreateParams;
+            HFONT hf = fonts ? fonts->plain : (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+            HFONT hfBold = fonts ? fonts->bold : NULL;
             HWND s1=CreateWindowW(L"STATIC",L"LAN Time Sync",WS_CHILD|WS_VISIBLE|SS_CENTER,16,16,348,20,hwnd,NULL,GetModuleHandleW(NULL),NULL);
             if(hfBold) SendMessageW(s1,WM_SETFONT,(WPARAM)hfBold,TRUE);
             HWND s2=CreateWindowW(L"STATIC",L"局域网强制时钟同步（SNTP over UDP）",WS_CHILD|WS_VISIBLE|SS_CENTER,16,38,348,16,hwnd,NULL,GetModuleHandleW(NULL),NULL);
@@ -264,11 +326,18 @@ static bool apply_live_server_from_ui(HWND hwnd) {
     char* p=tmp; while(*p==' '||*p=='\t') p++;
     char* e=p+strlen(p); while(e>p && (e[-1]==' '||e[-1]=='\t'||e[-1]=='\r'||e[-1]=='\n')) e--; *e='\0';
     if (!p[0]) { show_err(L"服务器地址不能为空。", L"错误"); return false; }
+    /* s_cfg 就是 main.c 的 g_cfg，worker 线程每秒都在读它。写入必须在状态锁内
+       完成，否则 worker 可能读到写了一半的 server 串。字符串解析放在锁外，
+       锁内只有一次内存写入。 */
+    util_state_lock();
     strncpy(s_cfg->server, p, sizeof(s_cfg->server)-1); s_cfg->server[sizeof(s_cfg->server)-1]='\0';
+    util_state_unlock();
     GetWindowTextW(GetDlgItem(hwnd?hwnd:s_hMain, IDC_EDIT_PORT), w, 64);
     int port = w_to_int(w, s_cfg->port);
     if (port<=0||port>65535) { show_err(L"端口范围 1-65535。", L"错误"); return false; }
+    util_state_lock();
     s_cfg->port = port;
+    util_state_unlock();
     return true;
 }
 
@@ -295,12 +364,28 @@ static void do_sync_now_gui(HWND hwnd) {
     GetTempFileNameW(wtmp, L"lts", 0, wtmpFile);
     WCHAR wresFile[MAX_PATH]=L"";
     GetTempFileNameW(wtmp, L"ltsres", 0, wresFile);
+    /* GetTempFileName 失败时目标缓冲不写入内容（保持 L""）。TEMP 路径超长
+       或权限不足时会走到这里，那时后续 --config/--result 参数都是空的，
+       提权子进程会静默跑一次空配置的同步。先显式拦掉并说明原因。 */
+    if (!wtmpFile[0] || !wresFile[0]) {
+        MessageBoxW(s_hMain,
+                   L"无法在临时目录下创建工作文件。\n请检查 %TEMP% 路径长度与权限，或把程序移到更短的路径后重试。",
+                   L"提示", MB_OK | MB_ICONWARNING);
+        return;
+    }
     /* GetTempFileName 会先建出一个空文件；子进程是原子改名落地的，
        留着这个空壳会让父进程立刻误判"结果已就绪"并读到空内容。 */
     DeleteFileW(wresFile);
 
     /* wide-char write, no ACP/UTF-8 loss; child deletes it via --temp-config */
     bool tmpOk = config_save_w(s_cfg, wtmpFile);
+    if (!tmpOk) {
+        /* GetTempFileName 已经真的建出了这个 0 字节文件，而它的自我清理
+           （--temp-config）在子进程里做；子进程不会启动时没人来删。
+           过去这里直接落到"用原配置路径"分支，wtmpFile 永远留在 %TEMP%。 */
+        DeleteFileW(wtmpFile);
+        wtmpFile[0] = L'\0';
+    }
     WCHAR exe[MAX_PATH]=L"";
     GetModuleFileNameW(NULL, exe, MAX_PATH);
     WCHAR params[1400]=L"";
@@ -397,9 +482,17 @@ static void poll_once_result(HWND hwnd) {
     InterlockedExchange64(&s_state->last_offset_ms, off);
     InterlockedExchange64(&s_state->last_rtt_ms,    rtt);
     InterlockedExchange64(&s_state->last_sync_sec,  (LONGLONG)time(NULL));
-    InterlockedIncrement(&s_state->synced_count);
+    // 成功才计入 synced_count。过去这里无条件自增，提权同步失败也会被
+    // 算成一次成功，界面上"成功次数"与"上次同步: 失败"自相矛盾。
+    if (ok) InterlockedIncrement(&s_state->synced_count);
+    else    InterlockedIncrement(&s_state->failed_count);
+    /* last_error 与 task_sync_once 共用同一把状态锁：
+       过去两侧各写各的，UI 可能读到新旧混合的串，把 UTF-8 多字节序列
+       从中间切断，状态栏偶发空白。 */
+    util_state_lock();
     strncpy(s_state->last_error, err, sizeof(s_state->last_error) - 1);
     s_state->last_error[sizeof(s_state->last_error) - 1] = '\0';
+    util_state_unlock();
     s_state->last_success = ok ? TRUE : FALSE;
     refresh_status(hwnd);
 
@@ -415,7 +508,38 @@ static void poll_once_result(HWND hwnd) {
 }
 
 // ---- 托盘 ----
-static void tray_add(HWND hwnd) {
+/* UIPI 放行：开机自启任务以 /RL HIGHEST 运行时进程是高完整性，
+   Explorer（中完整性）发来的托盘回调与 TaskbarCreated 广播会被 UIPI 静默丢弃，
+   现象就是"图标在、点击无反应"。ChangeWindowMessageFilter(Ex) 把这几条
+   消息加入允许列表。动态取函数地址：在比 Win7 更老的系统上安静跳过。 */
+static void tray_allow_message(HWND hwnd, UINT msg) {
+    if (!msg) return;
+    HMODULE hUser = GetModuleHandleW(L"user32.dll");
+    if (!hUser) return;
+    typedef BOOL (WINAPI *PFN_CWMFEx)(HWND, UINT, DWORD, void*);
+    PFN_CWMFEx pEx = (PFN_CWMFEx)GetProcAddress(hUser, "ChangeWindowMessageFilterEx");
+    if (pEx && hwnd) {
+        /* MSGFLT_ALLOW = 1 */
+        if (pEx(hwnd, msg, 1, NULL)) return;
+    }
+    typedef BOOL (WINAPI *PFN_CWMF)(UINT, DWORD);
+    PFN_CWMF p = (PFN_CWMF)GetProcAddress(hUser, "ChangeWindowMessageFilter");
+    if (p) p(msg, 1 /* MSGFLT_ADD */);
+}
+
+static HICON tray_icon(void) {
+    /* 图标句柄缓存后复用：重试循环里每次 LoadIcon 会泄漏 GDI 句柄 */
+    if (!s_hTrayIcon) {
+        s_hTrayIcon = LoadIconW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(IDI_APP));
+        if (!s_hTrayIcon) s_hTrayIcon = LoadIconW(NULL, IDI_APPLICATION);
+    }
+    return s_hTrayIcon;
+}
+
+/* 返回 TRUE 表示图标已确认加上。Explorer 尚未就绪 / 任务栏正忙时
+   NIM_ADD 会返回 FALSE，调用方（WM_CREATE / 重试定时器 / TaskbarCreated）
+   负责稍后重试，不在此阻塞等待。 */
+static BOOL tray_add(HWND hwnd) {
     NOTIFYICONDATAW nid; memset(&nid,0,sizeof(nid));
     /* Windows 7 只认识 NOTIFYICONDATA_V3_SIZE（x64 968 / x86 952 字节）；
        直接传 sizeof(nid)（含 guidItem/hBalloonIcon 等 Vista 之后新增字段，
@@ -426,17 +550,32 @@ static void tray_add(HWND hwnd) {
     nid.uID = ID_TRAY;
     nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = WM_TRAYICON;
-    nid.hIcon = LoadIconW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(IDI_APP));
-    if (!nid.hIcon) nid.hIcon = LoadIconW(NULL, IDI_APPLICATION);
+    nid.hIcon = tray_icon();
     wcscpy(nid.szTip, L"LAN Time Sync");
-    if (!Shell_NotifyIconW(NIM_ADD, &nid)) {
-        /* 极少数环境只接受 V2/V1：逐级回退重试，避免图标静默消失 */
-        nid.cbSize = NOTIFYICONDATAW_V2_SIZE;
-        if (!Shell_NotifyIconW(NIM_ADD, &nid)) {
-            nid.cbSize = NOTIFYICONDATAW_V1_SIZE;
-            Shell_NotifyIconW(NIM_ADD, &nid);
-        }
+    if (Shell_NotifyIconW(NIM_ADD, &nid)) {
+        if (!s_trayAdded) LOG_INFO("tray icon added");
+        s_trayAdded = TRUE;
+        return TRUE;
     }
+    /* 极少数环境只接受 V2/V1：逐级回退重试 */
+    nid.cbSize = NOTIFYICONDATAW_V2_SIZE;
+    if (Shell_NotifyIconW(NIM_ADD, &nid)) {
+        if (!s_trayAdded) LOG_INFO("tray icon added (V2 fallback)");
+        s_trayAdded = TRUE;
+        return TRUE;
+    }
+    nid.cbSize = NOTIFYICONDATAW_V1_SIZE;
+    if (Shell_NotifyIconW(NIM_ADD, &nid)) {
+        if (!s_trayAdded) LOG_INFO("tray icon added (V1 fallback)");
+        s_trayAdded = TRUE;
+        return TRUE;
+    }
+    /* 仍失败：最常见的是开机时任务栏还没建好。记一条 warn 供现场排查，
+       置 s_trayAdded=FALSE 让重试定时器继续。GetLastError 在
+       Shell_NotifyIcon 失败时通常无意义，不记录。 */
+    LOG_WARN("tray NIM_ADD failed (explorer not ready?), will retry");
+    s_trayAdded = FALSE;
+    return FALSE;
 }
 static void tray_remove(HWND hwnd) {
     NOTIFYICONDATAW nid; memset(&nid,0,sizeof(nid));
@@ -445,6 +584,7 @@ static void tray_remove(HWND hwnd) {
         nid.cbSize=NOTIFYICONDATAW_V2_SIZE;
         Shell_NotifyIconW(NIM_DELETE,&nid);
     }
+    s_trayAdded = FALSE;
 }
 static void tray_show_menu(HWND hwnd) {
     HMENU m = CreatePopupMenu();
@@ -504,6 +644,7 @@ static void ui_load_from_cfg(HWND hwnd) {
     CheckDlgButton(hwnd, IDC_CHECK_ALLOWLARGE, s_cfg->allow_large_offset ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(hwnd, IDC_CHECK_SYNCONSTART, s_cfg->sync_on_start ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(hwnd, IDC_CHECK_LOGENABLED, s_cfg->log_enabled ? BST_CHECKED : BST_UNCHECKED);
+    CheckDlgButton(hwnd, IDC_CHECK_WATERMARK, s_cfg->watermark_enabled ? BST_CHECKED : BST_UNCHECKED);
 }
 
 static bool ui_save_to_cfg(HWND hwnd) {
@@ -512,29 +653,42 @@ static bool ui_save_to_cfg(HWND hwnd) {
     // 去掉首尾空格
     char* p=tmp; while(*p==' '||*p=='\t') p++; char* e=p+strlen(p); while(e>p && (e[-1]==' '||e[-1]=='\t')) e--; *e='\0';
     if (!p[0]) { show_err(L"服务器地址不能为空。", L"错误"); return false; }
-    strncpy(s_cfg->server, p, sizeof(s_cfg->server)-1); s_cfg->server[sizeof(s_cfg->server)-1]='\0';
 
-    GetWindowTextW(GetDlgItem(hwnd, IDC_EDIT_PORT), w, 64); s_cfg->port = w_to_int(w, s_cfg->port);
-    if (s_cfg->port<=0||s_cfg->port>65535) { show_err(L"端口范围 1-65535。", L"错误"); return false; }
-    GetWindowTextW(GetDlgItem(hwnd, IDC_EDIT_INTERVAL), w, 64); s_cfg->interval_minutes = w_to_int(w, s_cfg->interval_minutes);
-    GetWindowTextW(GetDlgItem(hwnd, IDC_EDIT_RETRY), w, 64); s_cfg->retry_seconds = w_to_int(w, s_cfg->retry_seconds);
-    GetWindowTextW(GetDlgItem(hwnd, IDC_EDIT_TIMEOUT), w, 64); s_cfg->timeout_ms = w_to_int(w, s_cfg->timeout_ms);
-    GetWindowTextW(GetDlgItem(hwnd, IDC_EDIT_MAXOFF), w, 64); s_cfg->max_offset_ms = w_to_int(w, s_cfg->max_offset_ms);
-    GetWindowTextW(GetDlgItem(hwnd, IDC_EDIT_MINOFF), w, 64); s_cfg->min_offset_ms = w_to_int(w, s_cfg->min_offset_ms);
-    s_cfg->force_flag = IsDlgButtonChecked(hwnd, IDC_CHECK_FORCE)==BST_CHECKED;
+    /* 从控件解析出的值先全部落到局部变量，再一次性在状态锁内拷进 s_cfg。
+       过去是逐字段直接写 s_cfg，而 worker 线程正在同一份结构体上读——
+       其中"重载配置"还是整结构体赋值，可能让某次同步读到"新 server + 旧
+       timeout"这类混合配置。锁内只有内存写入，没有控件/文件 IO。 */
+    config_t nc;
+    util_state_lock();
+    nc = *s_cfg;          /* 以当前配置为基准，只改界面上出现的那些字段 */
+    util_state_unlock();
+    strncpy(nc.server, p, sizeof(nc.server)-1); nc.server[sizeof(nc.server)-1]='\0';
+    GetWindowTextW(GetDlgItem(hwnd, IDC_EDIT_PORT), w, 64); nc.port = w_to_int(w, s_cfg->port);
+    if (nc.port<=0||nc.port>65535) { show_err(L"端口范围 1-65535。", L"错误"); return false; }
+    GetWindowTextW(GetDlgItem(hwnd, IDC_EDIT_INTERVAL), w, 64); nc.interval_minutes = w_to_int(w, s_cfg->interval_minutes);
+    GetWindowTextW(GetDlgItem(hwnd, IDC_EDIT_RETRY), w, 64); nc.retry_seconds = w_to_int(w, s_cfg->retry_seconds);
+    GetWindowTextW(GetDlgItem(hwnd, IDC_EDIT_TIMEOUT), w, 64); nc.timeout_ms = w_to_int(w, s_cfg->timeout_ms);
+    GetWindowTextW(GetDlgItem(hwnd, IDC_EDIT_MAXOFF), w, 64); nc.max_offset_ms = w_to_int(w, s_cfg->max_offset_ms);
+    GetWindowTextW(GetDlgItem(hwnd, IDC_EDIT_MINOFF), w, 64); nc.min_offset_ms = w_to_int(w, s_cfg->min_offset_ms);
+    nc.force_flag = IsDlgButtonChecked(hwnd, IDC_CHECK_FORCE)==BST_CHECKED;
     /* force_enabled 是"是否写时钟"的总开关（config 中的 force_enabled），
        force_flag 是"激进/保守"模式选择。界面上的"强制模式"复选框对应 force_flag，
        不能把总开关一并赋值：否则用户在界面上取消勾选"强制模式"会静默关闭总开关，
        此后程序只测量不校时（日志里仍显示正常），排查起来非常隐蔽。 */
-    s_cfg->allow_large_offset = IsDlgButtonChecked(hwnd, IDC_CHECK_ALLOWLARGE)==BST_CHECKED;
-    s_cfg->sync_on_start = IsDlgButtonChecked(hwnd, IDC_CHECK_SYNCONSTART)==BST_CHECKED;
-    s_cfg->log_enabled = IsDlgButtonChecked(hwnd, IDC_CHECK_LOGENABLED)==BST_CHECKED;
+    nc.allow_large_offset = IsDlgButtonChecked(hwnd, IDC_CHECK_ALLOWLARGE)==BST_CHECKED;
+    nc.sync_on_start = IsDlgButtonChecked(hwnd, IDC_CHECK_SYNCONSTART)==BST_CHECKED;
+    nc.log_enabled = IsDlgButtonChecked(hwnd, IDC_CHECK_LOGENABLED)==BST_CHECKED;
     // 日志路径与配置文件固定使用默认路径，不再由界面输入
     {
         config_t def; config_init_defaults(&def);
-        strncpy(s_cfg->log_file, def.log_file, sizeof(s_cfg->log_file)-1);
-        s_cfg->log_file[sizeof(s_cfg->log_file)-1]='\0';
+        strncpy(nc.log_file, def.log_file, sizeof(nc.log_file)-1);
+        nc.log_file[sizeof(nc.log_file)-1]='\0';
     }
+    /* 一次性替换整份配置：worker 要么看到旧配置、要么看到新配置，
+       不会看到两者混合。 */
+    util_state_lock();
+    *s_cfg = nc;
+    util_state_unlock();
     // 保存到文件
     if (!config_save(s_cfg, s_cfgPath)) {
         WCHAR msg[600]; _snwprintf(msg,600,L"保存配置失败：\n%hs\n\n若路径在 ProgramData，请以管理员身份运行。", s_cfgPath);
@@ -571,9 +725,52 @@ static BOOL autostart_cached(void) {
 }
 static void autostart_invalidate(void) { s_autoValid = FALSE; }
 
+/* 看门狗：服务已安装但停了、且不是本会话内用户亲手停的，就静默把它拉起来。
+   覆盖"sc stop"这类干净停止——失败恢复动作只管异常退出，干净停止它不管。
+   保守策略：只在能静默成功时动手。非提权下 StartService 报 ACCESS_DENIED
+   是常态，此时只记一条 debug，不弹 UAC、不弹框打草惊蛇。
+   尝试频率上限 60 秒一次，避免二进制缺失等永久失败时空转刷日志。
+   s_userStoppedSvc 是会话级意图标记：用户亲手点的"停止/卸载"要尊重，
+   否则老师自己停了服务，看门狗 30 秒后又给拉起来，会以为见鬼了。 */
+static BOOL  s_userStoppedSvc = FALSE;
+static DWORD s_watchdogTick   = 0;
+
+/* 看门狗真正动手的部分跑在独立线程里：StartService 在服务卡住时会阻塞
+   到 SCM 超时（默认约 30 秒），放 UI 线程上等于界面假死。
+   和 svc_worker_thread 不复用：那个完成后会 PostMessage 进 on_svc_done，
+   而看门狗必须全程静默（失败不弹框、不碰 s_svcBusy，避免和用户操作互相干扰）。
+   线程与节流的关系：节流标记在起线程前就打上，SCM 超时 30 秒 < 节流 60 秒，
+   所以同一时间最多只有一个看门狗线程在跑。 */
+static DWORD WINAPI watchdog_thread(LPVOID param) {
+    (void)param;
+    if (service_start_svc()) {
+        LOG_INFO("watchdog: service was stopped unexpectedly, restarted");
+    } else {
+        DWORD e = GetLastError();
+        if (e == ERROR_ACCESS_DENIED)
+            LOG_DEBUG("watchdog: not elevated, skip silent restart");
+        else
+            LOG_WARN("watchdog: restart service failed err=%lu", e);
+    }
+    return 0;
+}
+
+static void watchdog_maybe_start_service(void) {
+    if (s_userStoppedSvc) return;
+    DWORD now = GetTickCount();
+    if (now - s_watchdogTick < 60000) return;   /* 无符号减法，回绕安全 */
+    s_watchdogTick = now;
+    HANDLE th = CreateThread(NULL, 0, watchdog_thread, NULL, 0, NULL);
+    if (th) CloseHandle(th);
+    else LOG_DEBUG("watchdog: CreateThread failed err=%lu", GetLastError());
+}
+
 static void refresh_service_status(HWND hwnd) {
     if (InterlockedCompareExchange(&s_svcBusy, 0, 0)) return; // 操作进行中不刷
     svc_state_t st = service_query_state();
+    /* 看门狗挂在这里：状态已经查出来了，不增加额外 SCM 开销。
+       操作进行中（s_svcBusy）时上面已直接返回，不会和用户点的启停打架。 */
+    if (st == SVC_STOPPED) watchdog_maybe_start_service();
 
     WCHAR w[128];
     WCHAR hint[256] = L"";
@@ -774,6 +971,9 @@ static void svc_launch(HWND hwnd, svc_op_t op) {
             show_err(L"需要管理员权限才能执行此操作。\n请右键以管理员身份运行本程序。", L"提示");
         } else if ((INT_PTR)r > 32) {
             // 提权子进程已启动，1.2s 后刷新状态
+            // 注：这条路径拿不到操作结果，所以不碰 s_userStoppedSvc。
+            // 没有关系：看门狗在非提权下本来就启不动服务（ACCESS_DENIED 静默跳过），
+            // 不会和用户点的停止打架；提权 GUI 的操作全走工作线程，标记正常维护。
             SetTimer(hwnd, 99, 1200, NULL);
         }
         return;
@@ -807,6 +1007,7 @@ static void on_svc_done(HWND hwnd, svc_op_t op, svc_job_t* job) {
             else if (err == ERROR_ACCESS_DENIED) show_err(L"安装失败：需要管理员权限。", L"错误");
             else { WCHAR m[256]; _snwprintf(m,256,L"安装失败，错误码 %lu。", err); show_err(m, L"错误"); }
         }
+        if (ok) s_userStoppedSvc = FALSE;        /* 刚装上：看门狗恢复工作 */
     } else if (op == SVC_OP_UNINSTALL) {
         if (ok) show_info(L"系统服务已卸载。", L"成功");
         else {
@@ -817,8 +1018,10 @@ static void on_svc_done(HWND hwnd, svc_op_t op, svc_job_t* job) {
         }
     } else if (op == SVC_OP_START) {
         if (!ok) { WCHAR m[256]; _snwprintf(m,256,L"启动服务失败，错误码 %lu。", err); show_err(m, L"错误"); }
+        else s_userStoppedSvc = FALSE;   /* 用户要它跑：看门狗恢复工作 */
     } else if (op == SVC_OP_STOP) {
         if (!ok) { WCHAR m[256]; _snwprintf(m,256,L"停止服务失败，错误码 %lu。", err); show_err(m, L"错误"); }
+        else s_userStoppedSvc = TRUE;    /* 用户亲手停的：看门狗本会话内不再拉起 */
     }
     autostart_invalidate();
     refresh_service_status(hwnd);
@@ -832,6 +1035,51 @@ static void do_svc_uninstall_gui(HWND hwnd) {
 static void do_svc_start_gui(HWND hwnd) { svc_launch(hwnd, SVC_OP_START); }
 static void do_svc_stop_gui(HWND hwnd)  { svc_launch(hwnd, SVC_OP_STOP); }
 
+/* ---- 开机自启动（异步）---- */
+static DWORD WINAPI startup_worker_thread(LPVOID param) {
+    startup_job_t* job = (startup_job_t*)param;
+    job->result = 0; job->err = 0;
+    if (startup_set(job->enable)) job->result = 1;
+    else job->err = GetLastError();
+    PostMessageW(job->hwnd, WM_STARTUP_DONE, 0, (LPARAM)job);
+    return 0;
+}
+
+static void startup_launch(HWND hwnd, bool enable) {
+    if (InterlockedCompareExchange(&s_startupBusy, 1, 0) != 0) return;
+    startup_job_t* job = (startup_job_t*)calloc(1, sizeof(startup_job_t));
+    if (!job) { InterlockedExchange(&s_startupBusy, 0); return; }
+    job->hwnd = hwnd; job->enable = enable;
+    CheckDlgButton(hwnd, IDC_CHECK_AUTOSTART, enable ? BST_CHECKED : BST_UNCHECKED);
+    HANDLE th = CreateThread(NULL, 0, startup_worker_thread, job, 0, NULL);
+    if (!th) {
+        free(job);
+        InterlockedExchange(&s_startupBusy, 0);
+        show_err(L"无法启动后台线程来设置开机自启动。", L"错误");
+        return;
+    }
+    CloseHandle(th);
+}
+
+static void on_startup_done(HWND hwnd, startup_job_t* job) {
+    InterlockedExchange(&s_startupBusy, 0);
+    DWORD err = job ? job->err : 0;
+    BOOL ok = job ? (job->result != 0) : FALSE;
+    if (job) free(job);
+
+    svc_state_t st = service_query_state();
+    if (st != SVC_NOT_INSTALLED && st != SVC_UNKNOWN) {
+        /* 服务已在运行时刷新会置灰复选框，这里同步一下 */
+        CheckDlgButton(hwnd, IDC_CHECK_AUTOSTART, BST_UNCHECKED);
+        show_info(L"系统服务已安装，无需再设置开机自启动。\n服务本身即为开机自启。", L"提示");
+        autostart_invalidate();
+        return;
+    }
+    if (!ok)
+        show_err(L"设置开机自启动失败。\n可在 UAC 弹窗中点“是”授权，或右键以管理员身份运行本程序。", L"错误");
+    autostart_invalidate();
+}
+
 /* ---- 状态刷新 ---- */
 static void refresh_status(HWND hwnd){
     if (!s_state) return;
@@ -839,21 +1087,30 @@ static void refresh_status(HWND hwnd){
     LONGLONG rtt = s_state->last_rtt_ms;
     LONGLONG last = s_state->last_sync_sec;
     BOOL ok = s_state->last_success;
-    const char* err = s_state->last_error;
+    /* last_error 由 worker 线程和本 UI 线程并发写，读也要在锁内做快照。
+       锁内只拷 256 字节，没有 IO，不会拖累 1 秒轮询。 */
+    char errSnap[256]; errSnap[0] = '\0';
+    util_state_lock();
+    memcpy(errSnap, s_state->last_error, sizeof(errSnap));
+    util_state_unlock();
+    const char* err = errSnap;
 
     WCHAR w[256];
     // 上次同步
     if (last==0) wcscpy(w, L"上次同步：从未");
     else {
-        time_t t=(time_t)last; struct tm tmv; localtime_s(&tmv, &t);
-        WCHAR ts[64]; wcsftime(ts,64,L"%Y-%m-%d %H:%M:%S", &tmv);
+        time_t t=(time_t)last; struct tm tmv; memset(&tmv,0,sizeof(tmv));
+        WCHAR ts[64]= L"";
+        /* localtime_s 失败时 tmv/ts 是未初始化的，直接 _snwprintf("%s")
+           会读栈上垃圾。失败就退回"?"，别把未知时间当真显示。 */
+        if (localtime_s(&tmv, &t) != 0 || wcsftime(ts,64,L"%Y-%m-%d %H:%M:%S", &tmv)==0)
+            wcscpy(ts, L"?");
         _snwprintf(w,256,L"上次同步：%s  %s", ts, ok?L"成功":L"失败");
     }
     SetWindowTextW(GetDlgItem(hwnd, IDC_LABEL_LASTSYNC), w);
 
     _snwprintf(w,256,L"偏移：%lld ms", (long long)off); SetWindowTextW(GetDlgItem(hwnd, IDC_LABEL_OFFSET), w);
     _snwprintf(w,256,L"RTT：%lld ms", (long long)rtt); SetWindowTextW(GetDlgItem(hwnd, IDC_LABEL_RTT), w);
-
     // 下次同步估算：用 interval - elapsed
     if (s_cfg) {
         time_t now=time(NULL);
@@ -962,12 +1219,13 @@ static void build_ui(HWND hwnd){
     create_button(hwnd, IDC_BTN_SVC_START,     L"启动服务",       460, 316, 62, 22, BS_PUSHBUTTON);
     create_button(hwnd, IDC_BTN_SVC_STOP,      L"停止服务",       530, 316, 62, 22, BS_PUSHBUTTON);
 
-    // 组：安全（移至快捷上方）
-    create_group(hwnd, -1, L"安全", 12, 342, 616, 48);
-    create_label(hwnd, IDC_LABEL_PWD_STATUS, auth_is_set() ? L"密码保护：已启用" : L"密码保护：未设置", 24, 360, 200, 16);
-    create_button(hwnd, IDC_BTN_SET_PWD,   L"设置密码", 260, 358, 90, 24, BS_PUSHBUTTON);
-    create_button(hwnd, IDC_BTN_CLEAR_PWD, L"清除密码", 360, 358, 90, 24, BS_PUSHBUTTON);
-    create_check(hwnd, IDC_CHECK_AUTOSTART, L"开机自启动", 470, 360, 110, 16);
+    // 组：安全 / 启动 / 水印（三者都是"常驻与保护"性质的开关，合并成一组）
+    create_group(hwnd, -1, L"安全 · 启动 · 水印", 12, 342, 616, 48);
+    create_label(hwnd, IDC_LABEL_PWD_STATUS, auth_is_set() ? L"密码保护：已启用" : L"密码保护：未设置", 24, 360, 186, 16);
+    create_button(hwnd, IDC_BTN_SET_PWD,   L"设置密码", 218, 358, 84, 24, BS_PUSHBUTTON);
+    create_button(hwnd, IDC_BTN_CLEAR_PWD, L"清除密码", 308, 358, 84, 24, BS_PUSHBUTTON);
+    create_check(hwnd, IDC_CHECK_AUTOSTART, L"开机自启动", 402, 360, 100, 16);
+    create_check(hwnd, IDC_CHECK_WATERMARK, L"桌面水印", 512, 360, 90, 16);
 
     // 组：本机时钟服务 (W32Time NTP Server)
     create_group(hwnd, IDC_GROUP_NTPSERVER, L"本机时钟服务", 12, 398, 616, 64);
@@ -988,11 +1246,45 @@ static void build_ui(HWND hwnd){
 
 // ---- 窗口过程 ----
 static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
+    /* 动态消息 ID 不能写进 case，在 switch 之前先判 */
+    if (s_msgTaskbarCreated && msg == s_msgTaskbarCreated) {
+        /* Explorer 重启/首次建好任务栏：旧图标已失效，必须重加 */
+        LOG_INFO("TaskbarCreated received, re-adding tray icon");
+        s_trayAdded = FALSE;
+        if (!tray_add(hwnd))
+            SetTimer(hwnd, TIMER_TRAY_RETRY, TRAY_RETRY_MS, NULL);
+        /* 水印贴在桌面（Progman/WorkerW）下面，Explorer 重启会把宿主连同
+           我们的子窗口一起销毁，这里一并重建。watermark_apply 内部会先
+           识别失效句柄。 */
+        if (s_cfg) watermark_apply(GetModuleHandleW(NULL), s_cfg);
+        return 0;
+    }
+    if (s_msgShowWindow && msg == s_msgShowWindow) {
+        /* 单实例唤起：第二个进程抢不到互斥体时发来此消息。
+           与托盘双击同一口径：设了密码必须先验证，否则密码形同虚设。 */
+        if (auth_is_set() && !auth_prompt_verify(hwnd)) return 0;
+        window_bring_to_front(hwnd);
+        return 0;
+    }
     switch(msg){
         case WM_CREATE:
             build_ui(hwnd);
             ui_load_from_cfg(hwnd);
-            tray_add(hwnd);
+            /* 注册跨进程消息：必须在 UIPI 放行与托盘添加之前就绪 */
+            if (!s_msgTaskbarCreated)
+                s_msgTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
+            if (!s_msgShowWindow)
+                s_msgShowWindow = RegisterWindowMessageW(L"LANTimeSync_ShowWindow");
+            /* 高完整性（开机 HIGHEST 任务）下放行托盘回调与跨进程消息，
+               否则 Explorer 的点击会被 UIPI 静默丢弃 */
+            tray_allow_message(hwnd, WM_TRAYICON);
+            tray_allow_message(hwnd, s_msgTaskbarCreated);
+            tray_allow_message(hwnd, s_msgShowWindow);
+            if (!tray_add(hwnd)) {
+                /* 开机时 Explorer 尚未就绪是常态：挂重试定时器，
+                   图标加上后在 TIMER 分支里自行停掉 */
+                SetTimer(hwnd, TIMER_TRAY_RETRY, TRAY_RETRY_MS, NULL);
+            }
             SetTimer(hwnd, TIMER_STATUS, 1000, NULL);
             refresh_status(hwnd);
             refresh_service_status(hwnd);
@@ -1008,7 +1300,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
                     case IDC_BTN_SYNC_NOW: do_sync_now_gui(hwnd); break;
                     case IDC_BTN_SAVE: if (ui_save_to_cfg(hwnd)) { show_info(L"配置已保存。", L"成功"); ui_load_from_cfg(hwnd); refresh_service_status(hwnd); } break;
                     case IDC_BTN_RELOAD: {
-                        config_t tmp; if (config_load(&tmp, s_cfgPath)) { *s_cfg=tmp; ui_load_from_cfg(hwnd); refresh_service_status(hwnd); show_info(L"已重载配置。", L"提示"); } else show_err(L"重载失败。", L"错误");
+                        config_t tmp; if (config_load(&tmp, s_cfgPath)) { util_state_lock(); *s_cfg=tmp; util_state_unlock(); ui_load_from_cfg(hwnd); refresh_service_status(hwnd); show_info(L"已重载配置。", L"提示"); } else show_err(L"重载失败。", L"错误");
                         break;
                     }
                     case IDC_BTN_VIEW_LOG: do_view_log_gui(); break;
@@ -1063,12 +1355,29 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
                             show_info(L"系统服务已安装，无需再设置开机自启动。\n服务本身即为开机自启。", L"提示");
                             break;
                         }
-                        if (!startup_set(checked)) {
-                            // 回滚复选框
-                            CheckDlgButton(hwnd, IDC_CHECK_AUTOSTART, checked?BST_UNCHECKED:BST_CHECKED);
-                            show_err(L"设置开机自启动失败。", L"错误");
+                        if (checked)
+                            show_info(L"接下来会请求管理员权限，用于创建开机自启动计划任务。\n请在 UAC 弹窗中点“是”。", L"提示");
+                        startup_launch(hwnd, checked ? true : false);
+                        break;
+                    }
+                    case IDC_CHECK_WATERMARK: {
+                        bool on = IsDlgButtonChecked(hwnd, IDC_CHECK_WATERMARK)==BST_CHECKED;
+                        util_state_lock();
+                        s_cfg->watermark_enabled = on;
+                        util_state_unlock();
+                        /* 即时生效：点完就能看到水印出现/消失，不用重启程序
+                           去猜有没有生效。 */
+                        watermark_apply(GetModuleHandleW(NULL), s_cfg);
+                        /* 一并落盘，否则下次启动又回到原设置，用户会以为开关没记住 */
+                        if (!config_save(s_cfg, s_cfgPath)) {
+                            WCHAR msg[600];
+                            _snwprintf(msg, 600, L"水印已%s，但保存配置失败：\n%hs\n\n重启后会回到原设置。",
+                                       on ? L"显示" : L"隐藏", s_cfgPath);
+                            msg[599] = L'\0';
+                            show_err(msg, L"保存失败");
+                        } else {
+                            LOG_INFO("desktop watermark %s via GUI", on ? "enabled" : "disabled");
                         }
-                        autostart_invalidate();
                         break;
                     }
                     case IDC_BTN_NTP_ENABLE:  ntp_launch(hwnd, NTP_OP_ENABLE); break;
@@ -1084,6 +1393,11 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         }
         case WM_TIMER:
             if (wp==TIMER_STATUS) { refresh_status(hwnd); refresh_service_status(hwnd); }
+            else if (wp==TIMER_TRAY_RETRY) {
+                if (s_trayAdded) KillTimer(hwnd, TIMER_TRAY_RETRY);
+                else if (tray_add(hwnd)) KillTimer(hwnd, TIMER_TRAY_RETRY);
+                /* 仍失败则保持定时器，下轮继续；tray_add 内已记 warn */
+            }
             else if (wp==TIMER_ONCE_RESULT) poll_once_result(hwnd);
             else if (wp==99) { KillTimer(hwnd, 99); refresh_service_status(hwnd); refresh_ntp_status(hwnd); }
             return 0;
@@ -1097,6 +1411,11 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
             ntp_op_t op = (ntp_op_t)wp;
             ntp_job_t* job = (ntp_job_t*)lp;
             on_ntp_done(hwnd, op, job);
+            return 0;
+        }
+        case WM_STARTUP_DONE: {
+            startup_job_t* job = (startup_job_t*)lp;
+            on_startup_done(hwnd, job);
             return 0;
         }
         case WM_TRAYICON:
@@ -1120,6 +1439,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
             return 0;
         case WM_DESTROY:
             KillTimer(hwnd, TIMER_STATUS);
+            KillTimer(hwnd, TIMER_TRAY_RETRY);
             KillTimer(hwnd, TIMER_ONCE_RESULT);
             if (s_onceResult[0]) { DeleteFileW(s_onceResult); s_onceResult[0] = L'\0'; }
             tray_remove(hwnd);
@@ -1178,9 +1498,13 @@ HWND window_create(HINSTANCE hInst, config_t* cfg, task_state_t* state,
 int window_message_loop(HWND hwnd){
     (void)hwnd;
     MSG msg;
-    while (GetMessageW(&msg, NULL, 0, 0) > 0) {
+    int r;
+    while ((r = GetMessageW(&msg, NULL, 0, 0)) > 0) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
-    return (int)msg.wParam;
+    /* GetMessageW 返回 -1 表示出错（如 hwnd 无效），此时 msg 内容未定义。
+       过去直接 return msg.wParam 会读一个未初始化结构体，把垃圾退出码
+       交给进程。出错按 1 返回，正常退出（WM_QUIT）才用 wParam。 */
+    return (r == 0) ? (int)msg.wParam : 1;
 }

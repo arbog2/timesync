@@ -3,6 +3,8 @@
 #include <stdarg.h>
 #include <string.h>
 #include <wchar.h>
+#include <aclapi.h>
+#include <sddl.h>
 
 /* ------------------------------------------------------------------ */
 /* logging                                                            */
@@ -10,6 +12,7 @@
 
 static FILE*  g_logFile  = NULL;
 static int    g_minLevel = LOG_LEVEL_INFO;
+static volatile LONG g_logOpenFailed = 0;   /* 配了日志却打不开 */
 static CRITICAL_SECTION g_lock;
 
 static void log_lock_init(void) {
@@ -67,11 +70,24 @@ void util_log_init(const char* logFile, int minLevel) {
        读 g_logFile，锁外赋值会撞上 fclose 之后的悬空 FILE*（UI 线程"应用并保存"
        时正好会发生）。文件打开放在锁外，避免持锁做 I/O。 */
     FILE* nf = (logFile && logFile[0]) ? fopen(logFile, "a") : NULL;
+    if (logFile && logFile[0] && !nf) {
+        /* 打不开就不再静默：记一条 OutputDebugString（此时还没有日志可写），
+           并置标志让 GUI 的"查看日志"能把这个失败说出来。 */
+        OutputDebugStringA("LANTimeSync: cannot open log file (permission/disk?): ");
+        OutputDebugStringA(logFile);
+        InterlockedExchange(&g_logOpenFailed, 1);
+    } else if (nf) {
+        InterlockedExchange(&g_logOpenFailed, 0);
+    }
     EnterCriticalSection(&g_lock);
     if (g_logFile) fclose(g_logFile);
     g_logFile = nf;
     g_minLevel = minLevel;
     LeaveCriticalSection(&g_lock);
+}
+
+bool util_log_active(void) {
+    return InterlockedCompareExchange(&g_logOpenFailed, 0, 0) == 0;
 }
 
 void util_log_set_min_level(int level) {
@@ -119,6 +135,84 @@ void util_logf(int level, const char* fmt, ...) {
     }
 
     LeaveCriticalSection(&g_lock);
+}
+
+/* ------------------------------------------------------------------ */
+/* shared state lock                                                  */
+/* ------------------------------------------------------------------ */
+
+static CRITICAL_SECTION g_stateLock;
+static volatile LONG    g_stateLockInited = 0;
+
+/* 惰性初始化：util.c 没有构造函数，多个翻译单元在静态初始化阶段都可能引用它，
+   用 InterlockedCompareExchange 保证只 InitializeCriticalSection 一次。 */
+static void state_lock_init(void) {
+    if (InterlockedCompareExchange(&g_stateLockInited, 1, 0) == 0)
+        InitializeCriticalSectionAndSpinCount(&g_stateLock, 0x400);
+}
+
+void util_state_lock(void) {
+    state_lock_init();
+    EnterCriticalSection(&g_stateLock);
+}
+
+void util_state_unlock(void) {
+    LeaveCriticalSection(&g_stateLock);
+}
+
+/* ------------------------------------------------------------------ */
+/* program directory ACL                                              */
+/* ------------------------------------------------------------------ */
+
+/* SDDL：P = 受保护的 DACL（切断 ProgramData 的继承，否则继承来的 RX 会把
+   下面这条 Users 条目盖掉）。四条 ACE 覆盖全部需要访问的身份：
+   BA = Administrators(F)，SY = SYSTEM(F)，CO = 创建者所有者(F)，
+   BU = BUILTIN\Users(GRGWGX：泛读 + 泛写 + 泛执行)。
+   ConvertStringSecurityDescriptorToSecurityDescriptorW 自 XP 起可用，Win7 无虞。 */
+#define LANTS_SDDL L"D:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;FA;;;CO)(A;OICI;GRGWGX;;;BU)"
+
+static void grant_users_modify(const WCHAR* dirW) {
+    if (!dirW || !dirW[0]) return;
+    PSECURITY_DESCRIPTOR sd = NULL;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            LANTS_SDDL, SDDL_REVISION_1, &sd, NULL))
+        return;
+    /* PSECURITY_DESCRIPTOR 是自描述的安全描述符（Win32 里表现为一个
+       不透明的指针），没有公开的结构体定义，不能直接 ->Dacl；
+       必须用 GetSecurityDescriptorDacl 从里面取出 DACL 指针。 */
+    PACL dacl = NULL;
+    BOOL present = FALSE, defaulted = FALSE;
+    if (!GetSecurityDescriptorDacl(sd, &present, &dacl, &defaulted) || !dacl) {
+        LocalFree(sd);
+        return;
+    }
+    /* 整条 DACL 覆盖式设置：幂等，重复调用结果一致 */
+    DWORD rc = SetNamedSecurityInfoW((LPWSTR)dirW, SE_FILE_OBJECT,
+                                     DACL_SECURITY_INFORMATION,
+                                     NULL, NULL, dacl, NULL);
+    LocalFree(sd);
+    if (rc != ERROR_SUCCESS)
+        LOG_DEBUG("SetNamedSecurityInfo(%ls) rc=%lu (ignored)", dirW, rc);
+}
+
+void util_ensure_program_dir(void) {
+    char prog[MAX_PATH] = "";
+    if (!GetEnvironmentVariableA("ProgramData", prog, sizeof(prog)))
+        return;
+    char dir[MAX_PATH + 32] = "";
+    _snprintf(dir, sizeof(dir), "%s\\LANTimeSync", prog);
+    dir[sizeof(dir) - 1] = '\0';
+
+    if (GetFileAttributesA(dir) == INVALID_FILE_ATTRIBUTES) {
+        ensure_parent_dir(dir);        /* 递归建父目录 */
+        CreateDirectoryA(dir, NULL);
+    }
+    /* 无论刚才新建的还是已存在的，都把 DACL 设一遍。
+       目录可能由 SYSTEM（开机先跑的服务）或 /RL HIGHEST 任务先建好，
+       那种情况下属主是 SYSTEM、普通用户写不进去——这正是要修的静默失败。 */
+    WCHAR dirW[MAX_PATH] = L"";
+    if (MultiByteToWideChar(CP_UTF8, 0, dir, -1, dirW, MAX_PATH) > 0)
+        grant_users_modify(dirW);
 }
 
 /* ------------------------------------------------------------------ */

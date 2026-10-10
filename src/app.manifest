@@ -16,8 +16,13 @@
   </dependency>
   <application xmlns="urn:schemas-microsoft-com:asm.v3">
     <windowsSettings>
+      <!-- 只用 PerMonitorV2（2016 命名空间）是有问题的：本程序没有
+           WM_DPICHANGED 处理，坐标是硬编码像素，声明了 PerMonitorV2
+           却不去响应 DPI 变化，窗口和控件会各自缩放、反而错位。
+           用系统 DPI 感知（2005 命名空间的 true）：Win7/8.1/10 都能
+           正确按主屏 DPI 放大一次，与 ensure_font 里 MulDiv(9, LOGPIXELSY, 72)
+           的计算口径一致。Win7 完全不认识 2016 命名空间，故一并移除。 -->
       <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true</dpiAware>
-      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2, PerMonitor</dpiAwareness>
     </windowsSettings>
   </application>
   <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">

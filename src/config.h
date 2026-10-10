@@ -21,6 +21,18 @@ typedef struct {
     char  log_file[MAX_PATH];
     bool  log_enabled;
     int   log_level;
+
+    /* ---- 桌面水印 ----
+       在桌面右上角以黄色文字显示本机机器名，机房/考场里让学生一眼看出
+       自己坐在哪台机器上。实现是 topmost + 点击穿透 + 不进任务栏的
+       分层窗口，只挡视线、不挡操作。 */
+    bool  watermark_enabled;
+    char  watermark_text[160];   /* 空 = 直接用机器名；否则为模板，%COMPUTERNAME% 会被替换 */
+    int   watermark_size;        /* 字高（像素）；<=0 = 按屏幕高度自动 */
+    int   watermark_opacity;     /* 文字不透明度 0-255 */
+    int   watermark_background;  /* 文字下方深色底衬的不透明度；0 = 纯文字无底衬 */
+    bool  watermark_on_top;      /* false(默认)=贴桌面，只在桌面可见；
+                                    true=永远置顶，盖在所有窗口之上 */
 } config_t;
 
 /* defaults for missing keys */

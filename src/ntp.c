@@ -178,14 +178,16 @@ int ntp_sync(const char* host, int port, int timeout_ms, ntp_result_t* r) {
     return 0;
 }
 
-/* take the lowest-RTT sample from a short burst */
+/* take the lowest-RTT sample from a short burst.
+   cancel 在每个采样之间求值，用于让停止流程不必等完整轮采样结束。 */
 int ntp_sync_best(const char* host, int port, int timeout_ms,
-                  int samples, ntp_result_t* out) {
+                  int samples, ntp_cancel_fn cancel, ntp_result_t* out) {
     memset(out, 0, sizeof(*out));
     if (samples < 1) samples = 1;
     int best = INT32_MAX;
     int last_rc = -1; /* remember the last failure for the caller */
     for (int i = 0; i < samples; i++) {
+        if (cancel && cancel()) return NTP_ERR_CANCELLED;
         ntp_result_t r;
         int rc = ntp_sync(host, port, timeout_ms, &r);
         if (rc != 0) { last_rc = rc; continue; }

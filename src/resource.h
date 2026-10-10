@@ -62,4 +62,7 @@
 #define IDC_BTN_NTP_DISABLE      1055
 #define IDC_BTN_NTP_CHECK        1056
 
+/* 桌面水印 */
+#define IDC_CHECK_WATERMARK      1057
+
 #endif /* RESOURCE_H */

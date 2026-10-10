@@ -26,6 +26,30 @@ void util_logf(int level, const char* fmt, ...);
 /* single instance lock via named mutex; returns NULL if acquired else existing handle */
 HANDLE util_single_instance(const char* name);
 
+/* ---------- shared state lock ----------
+   进程内多处"UI 线程写、worker 线程读"的共享状态（config 整块、task_state
+   的 last_error 等）都串在这一把锁上。锁内只做内存拷贝、不做 IO、不起线程，
+   因此各线程持锁时间都是微秒级。
+   这些字段此前由各调用方自行同步（有的完全没有），导致整结构体赋值与逐字段
+   读取并发、UTF-8 序列被从中间改写等数据竞争。统一收敛到此处。 */
+void util_state_lock(void);
+void util_state_unlock(void);
+
+/* ---------- program directory ----------
+   %ProgramData%\LANTimeSync 下放着 config.ini、日志与 auth.dat。
+   该目录若由 SYSTEM（服务）或开机 /RL HIGHEST 任务先创建，属主是 SYSTEM，
+   之后登录的标准用户既写不了日志也存不了配置，而且失败是静默的——
+   没有任何弹窗、日志里也只剩"打不开"的间接痕迹。
+   这里在进程启动时统一建目录并把 ACL 放开到 BUILTIN\Users，
+   让同一台机器上的任何账户都能写（本程序的形态是单机单 LOG，无多租户隔离需求）。
+   非致命：设 ACL 失败只记 debug，不影响后续逻辑。 */
+void util_ensure_program_dir(void);
+
+/* ---------- logging ---------- */
+/* 日志是否真的可写。log_enabled=true 但文件打不开时（权限/磁盘/路径）为 false。
+   GUI 用它在"查看日志"处把静默失败变成一句可见的提示。 */
+bool util_log_active(void);
+
 /* ---------- privilege / architecture probes ----------
    这些探针此前在 service.c / startup.c / ntpserver.c / timeset.c 里各存一份
    几乎逐字相同的实现（4 份 is_elevated、2 份 is_wow64、2 份 System32 路径拼接）。

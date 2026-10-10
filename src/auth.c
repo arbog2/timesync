@@ -118,7 +118,12 @@ bool auth_clear(void) {
 #define IDC_PWD_LABEL   104
 #define IDC_PWD_LABEL2  105
 
-typedef struct { bool isSet; bool ok; WCHAR pwd[128]; WCHAR pwd2[128]; } PwdCtx;
+/* 密码框上下文。font 由 pwd_dialog 创建、随窗口关闭统一释放：
+   Win32 控件不拥有通过 WM_SETFONT 收到的字体，应用负责销毁。
+   过去字体在 WM_CREATE 里建、全程不释放，每弹一次密码框泄漏 1 个
+   GDI 句柄；常驻托盘进程活几周就能攒到 GDI 上限（约 10000/进程），
+   之后 CreateFont 等分配开始失败，表现为字体回退、绘制异常。 */
+typedef struct { bool isSet; bool ok; WCHAR pwd[128]; WCHAR pwd2[128]; HFONT font; } PwdCtx;
 
 static LRESULT CALLBACK PwdWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
     PwdCtx* ctx=(PwdCtx*)GetWindowLongPtrW(hwnd,GWLP_USERDATA);
@@ -127,11 +132,7 @@ static LRESULT CALLBACK PwdWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
             CREATESTRUCTW* cs=(CREATESTRUCTW*)lp;
             SetWindowLongPtrW(hwnd,GWLP_USERDATA,(LONG_PTR)cs->lpCreateParams);
             ctx=(PwdCtx*)cs->lpCreateParams;
-            HFONT hf=(HFONT)GetStockObject(DEFAULT_GUI_FONT);
-            HDC hdc=GetDC(hwnd); int dpi=GetDeviceCaps(hdc,LOGPIXELSY); ReleaseDC(hwnd,hdc);
-            int h=-MulDiv(9,dpi,72);
-            HFONT hf2=CreateFontW(h,0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH|FF_DONTCARE,L"Microsoft YaHei UI");
-            if(hf2) hf=hf2;
+            HFONT hf = ctx->font ? ctx->font : (HFONT)GetStockObject(DEFAULT_GUI_FONT);
             if(ctx->isSet){
                 CreateWindowW(L"STATIC",L"请输入密码：",WS_CHILD|WS_VISIBLE,16,16,260,16,hwnd,(HMENU)IDC_PWD_LABEL,GetModuleHandleW(NULL),NULL);
                 HWND e=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"",WS_CHILD|WS_VISIBLE|ES_PASSWORD|WS_TABSTOP,16,36,260,22,hwnd,(HMENU)IDC_PWD_EDIT,GetModuleHandleW(NULL),NULL);
@@ -175,6 +176,7 @@ static LRESULT CALLBACK PwdWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
 static volatile LONG s_pwdActive = 0;
 
 static bool pwd_dialog(HWND parent, bool isVerify, WCHAR* outPwd, int cap){
+    if (cap <= 0) return false;
     // 防止重入：托盘双击/单机可能在密码框消息循环内再次触发 WM_TRAYICON，
     // 若此时再次进入 pwd_dialog，会产生两个重叠的密码框且销毁时残留
     if (InterlockedCompareExchange(&s_pwdActive, 1, 0) != 0) {
@@ -185,6 +187,17 @@ static bool pwd_dialog(HWND parent, bool isVerify, WCHAR* outPwd, int cap){
     bool isSet = isVerify;
     PwdCtx ctx; memset(&ctx,0,sizeof(ctx));
     ctx.isSet=isSet; ctx.ok=false;
+    /* 字体在这里建：随窗口关闭统一释放（见函数尾部），避免每次弹窗泄漏
+       一个 GDI 句柄。 */
+    {
+        HDC hdc = GetDC(NULL);
+        int dpi = hdc ? GetDeviceCaps(hdc, LOGPIXELSY) : 96;
+        if (hdc) ReleaseDC(NULL, hdc);
+        ctx.font = CreateFontW(-MulDiv(9, dpi, 72),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,
+                               DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,
+                               CLEARTYPE_QUALITY,DEFAULT_PITCH|FF_DONTCARE,
+                               L"Microsoft YaHei UI");
+    }
     const WCHAR* cls=L"LANTimeSyncPwdDlg";
     WNDCLASSW wc; memset(&wc,0,sizeof(wc));
     wc.lpfnWndProc=PwdWndProc; wc.hInstance=GetModuleHandleW(NULL);
@@ -220,6 +233,9 @@ static bool pwd_dialog(HWND parent, bool isVerify, WCHAR* outPwd, int cap){
     }
     UnregisterClassW(cls, GetModuleHandleW(NULL));
     InterlockedExchange(&s_pwdActive, 0);
+    /* 窗口已销毁，字体安全释放。创建失败时 ctx.font 为 NULL，DeleteObject(NULL)
+       是无害操作，但显式判一下更清楚。 */
+    if (ctx.font) DeleteObject(ctx.font);
     if(!ctx.ok) return false;
     wcsncpy(outPwd, ctx.pwd, cap); outPwd[cap-1]=L'\0';
     SecureZeroMemory(ctx.pwd,sizeof(ctx.pwd));

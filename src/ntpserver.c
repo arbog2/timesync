@@ -159,15 +159,24 @@ static void firewall_cache_invalidate(void) {
 
 ntp_state_t ntp_query_state(void) {
     DWORD en = reg_get_dword(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Services\\W32Time\\TimeProviders\\NtpServer", L"Enabled", 0);
+    /* AnnounceFlags 的合法值：5 = 可靠时钟源，10 = 不可靠但宣告。
+       过去这里写成 af!=5 && af!=10 && af!=0x0A——10 与 0x0A 是同一个数，
+       第三个条件是死人，只会让读代码的人以为还有第三种合法值。 */
     DWORD af = reg_get_dword(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Services\\W32Time\\Config", L"AnnounceFlags", 0);
-    if (en!=1 || (af!=5 && af!=10 && af!=0x0A)) return NTP_DISABLED;
+    if (en != 1 || (af != 5 && af != 10)) return NTP_DISABLED;
 
     int ws = w32_query();
-    if (ws==0) return NTP_ENABLED_STOPPED;
-    if (ws!=1) return NTP_ENABLED_RUNNING;
-
-    if (!firewall_has_rule_hidden()) return NTP_ENABLED_FIREWALL_BLOCKED;
-    return NTP_ENABLED_RUNNING;
+    if (ws == 0) return NTP_ENABLED_STOPPED;
+    /* ws 的取值：1 运行中，0 已停止，2 正在启动/停止等中间态，
+       98 服务不存在，99 查询失败。后三种都不是"已停止"，
+       不能一律报 RUNNING——尤其是 99（连 SCM 都打不开）时
+       报"正常对外提供时间"会把用户带到完全错误的方向。 */
+    if (ws == 1) {
+        if (!firewall_has_rule_hidden()) return NTP_ENABLED_FIREWALL_BLOCKED;
+        return NTP_ENABLED_RUNNING;
+    }
+    if (ws == 2) return NTP_ENABLED_RUNNING;   /* 启动中，按已开启处理 */
+    return NTP_UNKNOWN;
 }
 
 static DWORD run_hidden(WCHAR *cmdline, DWORD timeoutMs) {

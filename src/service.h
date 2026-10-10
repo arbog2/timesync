@@ -37,4 +37,11 @@ bool service_is_elevated(void);
 void  service_set_stopping(void);
 bool  service_is_stopping(void);
 
+/* 等待 worker 线程收尾，期间向 SCM 持续上报 STOP_PENDING 进度点。
+   必须由 svc_main 在收到停止控制之后调用。
+   waitMaxMs 为上限（一次同步最坏可阻塞 3 × timeout_ms ≈ 30s，
+   建议传 60s 以覆盖系统繁忙时的抖动）。
+   返回 true 表示 worker 已退出。 */
+bool  service_join_worker(HANDLE th, DWORD waitMaxMs);
+
 #endif /* SERVICE_H */

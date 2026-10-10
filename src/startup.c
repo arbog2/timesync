@@ -88,6 +88,14 @@ static bool is_elevated(void) {
     return util_is_elevated();
 }
 
+/* schtasks 的一次性操作超时。开机路径必须短（否则拖住登录），
+   而在安装/卸载这类"用户在等"的路径上可以放宽——一个 /Create
+   在 Task Scheduler 忙时等十几秒是正常的。超时仍然会杀掉子进程
+   （不能无限挂住），但至少留出余地，避免把一个半途执行完的 schtasks
+   从中间砍断。 */
+#define SCHTASKS_TIMEOUT_BOOT  8000
+#define SCHTASKS_TIMEOUT_USER  30000
+
 static DWORD run_hidden_and_wait(WCHAR *cmdline, DWORD timeoutMs) {
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
@@ -105,58 +113,52 @@ static DWORD run_hidden_and_wait(WCHAR *cmdline, DWORD timeoutMs) {
     CloseHandle(pi.hProcess);
     return code;
 }
-
 static bool task_exists_fast(void) {
     // 使用 Sysnative 感知的路径，避免 32 位在 64 位 Win7 上被重定向到 SysWOW64
     WCHAR taskFile[MAX_PATH]=L"";
     get_task_file_path(taskFile, MAX_PATH);
-    DWORD attr = GetFileAttributesW(taskFile);
-    if (attr != INVALID_FILE_ATTRIBUTES) return true;
+    if (GetFileAttributesW(taskFile)!=INVALID_FILE_ATTRIBUTES) return true;
+
     DWORD err = GetLastError();
-    if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) {
-        // 再查一次 Sysnative/Tasks 目录下是否有旧任务，兼容 32/64 交叉
-        // 若探针路径不同，再试一次硬编码 System32，避免 Sysnative 探针误判
-        WCHAR alt[MAX_PATH]=L"";
-        WCHAR win[MAX_PATH]=L""; util_get_windows_dir(win, MAX_PATH);
-        _snwprintf(alt, MAX_PATH, L"%s\\System32\\Tasks\\LANTimeSync", win);
-        alt[MAX_PATH-1]=L'\0';
-        if (wcscmp(alt, taskFile)!=0) {
-            if (GetFileAttributesW(alt)!=INVALID_FILE_ATTRIBUTES) return true;
-        }
-        // 仍未找到：若注册表回退存在，也视为已启用，便于迁移
-        // 由外层统一处理
-    } else {
-        // 无法判断（如权限不足）：回退到 schtasks 查询
+    if (err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND) {
+        /* 不是"不存在"而是读不到（权限不足等）：只能老老实实问 schtasks。
+           这一步会拉起一次进程，最多等 4 秒，所以调用方（UI 定时器）
+           必须带缓存，不能每秒调。 */
         WCHAR sch[MAX_PATH]=L""; get_schtasks_path(sch, MAX_PATH);
         WCHAR cmd[1024];
         _snwprintf(cmd, 1024, L"\"%s\" /Query /TN \"%s\"", sch, TASK_NAME);
         cmd[1023]=L'\0';
         WCHAR mutableCmd[1024]; wcscpy(mutableCmd, cmd);
-        DWORD code = run_hidden_and_wait(mutableCmd, 4000);
-        return code == 0;
+        return run_hidden_and_wait(mutableCmd, 4000)==0;
     }
-    if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) return false;
-    // 其他错误回退到 schtasks 查询
-    WCHAR sch[MAX_PATH]=L""; get_schtasks_path(sch, MAX_PATH);
-    WCHAR cmd2[1024];
-    _snwprintf(cmd2, 1024, L"\"%s\" /Query /TN \"%s\"", sch, TASK_NAME);
-    cmd2[1023]=L'\0';
-    WCHAR mutableCmd2[1024]; wcscpy(mutableCmd2, cmd2);
-    DWORD code = run_hidden_and_wait(mutableCmd2, 4000);
-    return code == 0;
+
+    // 任务文件确实不存在：再查一次硬编码 System32 下是否有旧任务，
+    // 兼容 32/64 交叉（Sysnative 探针在纯 32 位系统上会偏）
+    WCHAR alt[MAX_PATH]=L"";
+    WCHAR win[MAX_PATH]=L""; util_get_windows_dir(win, MAX_PATH);
+    _snwprintf(alt, MAX_PATH, L"%s\\System32\\Tasks\\LANTimeSync", win);
+    alt[MAX_PATH-1]=L'\0';
+    if (wcscmp(alt, taskFile)!=0 && GetFileAttributesW(alt)!=INVALID_FILE_ATTRIBUTES)
+        return true;
+    /* 注：这里不查注册表回退。startup_is_enabled() 已经单独查了
+       reg_is_enabled()，而本函数只回答"计划任务是否存在"，
+       把两件事混在一起只会让调用方的判断变得不可预测。 */
+    return false;
 }
 
-static bool run_schtasks_elevated_if_needed(const WCHAR *params) {
+static bool run_schtasks_elevated_if_needed(const WCHAR *params, DWORD timeoutMs) {
     if (is_elevated()) {
         WCHAR sch[MAX_PATH]=L""; get_schtasks_path(sch, MAX_PATH);
         WCHAR cmd[2048];
         _snwprintf(cmd, 2048, L"\"%s\" %s", sch, params);
         cmd[2047]=L'\0';
         WCHAR mutableCmd[2048]; wcscpy(mutableCmd, cmd);
-        DWORD code = run_hidden_and_wait(mutableCmd, 8000);
+        DWORD code = run_hidden_and_wait(mutableCmd, timeoutMs);
         if (code==0) return true;
-        // Win7 上 schtasks 可能需要 /IT 或用户名，失败时记录到日志便于现场排查
-        // LOG 将在调用方记录
+        /* schtasks 退出码 1 通常是"任务不存在"（删除场景），
+           由调用方按需判定；这里把超时/被杀区分出来，便于现场排查 */
+        if (code == 0xFFFFFFFFu)
+            LOG_WARN("schtasks timed out or failed to start (params=%ls)", params);
         return false;
     }
     SHELLEXECUTEINFOW sei;
@@ -170,9 +172,10 @@ static bool run_schtasks_elevated_if_needed(const WCHAR *params) {
     sei.nShow = SW_HIDE;
     if (!ShellExecuteExW(&sei)) return false;
     if (!sei.hProcess) return true;
-    DWORD wait = WaitForSingleObject(sei.hProcess, 8000);
+    DWORD wait = WaitForSingleObject(sei.hProcess, timeoutMs);
     DWORD code = 1;
     if (wait == WAIT_OBJECT_0) GetExitCodeProcess(sei.hProcess, &code);
+    else LOG_WARN("schtasks (runas) timed out; killed");
     CloseHandle(sei.hProcess);
     return code == 0;
 }
@@ -189,10 +192,16 @@ static bool task_create_internal(const WCHAR *tname, const WCHAR *exe, bool with
             _snwprintf(params, 2048, L"/Create /TN \"%s\" /TR \"\\\"%s\\\" --tray\" /SC ONLOGON /RL HIGHEST /F", tname, exe);
         }
     } else {
-        _snwprintf(params, 2048, L"/Create /TN \"%s\" /TR \"\\\"%s\\\" --tray\" /SC ONLOGON /F", tname, exe);
+        /* 托盘伴随任务不带 HIGHEST，因此 /IT 在所有系统上都合法（/IT 只与
+           HIGHEST 在 Win10+ 上互斥）。显式 /IT 保证任务以交互式进桌面，
+           避免在 Win7 上被配成非交互而跑进看不见的会话（有进程、无托盘、
+           无法唤起）。与主任务的 Win7 分支保持一致。 */
+        _snwprintf(params, 2048, L"/Create /TN \"%s\" /TR \"\\\"%s\\\" --tray\" /SC ONLOGON /IT /F", tname, exe);
     }
     params[2047]=L'\0';
-    return run_schtasks_elevated_if_needed(params);
+    /* 创建/删除任务都放 30 秒：这是用户点了按钮在等的一次性操作，
+       开机路径不走这里（见 startup_ensure_tray_args，用 8 秒档）。 */
+    return run_schtasks_elevated_if_needed(params, SCHTASKS_TIMEOUT_USER);
 }
 
 static bool task_create(void) {
@@ -213,7 +222,7 @@ static bool task_delete_one(const WCHAR *tname) {
     WCHAR params[512];
     _snwprintf(params, 512, L"/Delete /TN \"%s\" /F", tname);
     params[511]=L'\0';
-    bool ok = run_schtasks_elevated_if_needed(params);
+    bool ok = run_schtasks_elevated_if_needed(params, SCHTASKS_TIMEOUT_USER);
     if (ok) return true;
     // schtasks 返回 1 通常为不存在，视为已清理
     WCHAR tf[MAX_PATH]=L"";
@@ -247,7 +256,9 @@ static bool tray_task_exists_fast(void) {
     return run_hidden_and_wait(m, 4000)==0;
 }
 static bool tray_task_ensure(void) {
-    if (tray_task_exists_fast()) return true;
+    /* 不做 exists-fast 短路：每次安装/重装服务都用 /F 覆写一次，
+       顺带把旧版建出的无 /IT 托盘任务迁移为交互式。service_install
+       本身已在提权上下文中，覆写不会引入额外的 UAC。 */
     WCHAR exe[MAX_PATH]=L""; GetModuleFileNameW(NULL, exe, MAX_PATH);
     if (!exe[0]) return false;
     // 托盘任务不带 HIGHEST，避免 Win7 上重复提权，且与服务校时不冲突
@@ -303,21 +314,64 @@ static bool task_has_tray_flag_file(const WCHAR *taskFile) {
     return false;
 }
 
+/* 一次性迁移标记：旧任务补上 --tray 后就不再试第二次。
+   标准用户的机器上 task_create() 最终只能落到 HKCU\Run 回退，任务文件
+   依然没有 --tray；没有这个标记的话，每次登录都会走到 schtasks 的
+   runas 分支弹一次 UAC——开机弹窗没修掉，反而多弹一个授权框。
+   写在 HKCU：自启任务本身就是按用户建的，跟随用户身份正合适。 */
+#define MIGRATE_KEY  L"Software\\LANTimeSync"
+#define MIGRATE_VAL  L"TaskAutoStartMigrated"
+
+static bool startup_migration_done(void) {
+    HKEY hk;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, MIGRATE_KEY, 0, KEY_READ, &hk) != ERROR_SUCCESS)
+        return false;
+    DWORD v = 0, cb = sizeof(v), type = 0;
+    LONG r = RegQueryValueExW(hk, MIGRATE_VAL, NULL, &type, (BYTE*)&v, &cb);
+    RegCloseKey(hk);
+    return r == ERROR_SUCCESS && type == REG_DWORD && v == 1;
+}
+
+static void startup_mark_migrated(void) {
+    HKEY hk;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, MIGRATE_KEY, 0, NULL, 0, KEY_WRITE, NULL, &hk, NULL) != ERROR_SUCCESS)
+        return;
+    DWORD v = 1;
+    RegSetValueExW(hk, MIGRATE_VAL, 0, REG_DWORD, (BYTE*)&v, sizeof(v));
+    RegCloseKey(hk);
+}
+
 void startup_ensure_tray_args(void) {
     WCHAR tf[MAX_PATH]=L""; get_task_file_path(tf, MAX_PATH);
     if (GetFileAttributesW(tf)==INVALID_FILE_ATTRIBUTES) {
-        // 主任务不存在时不折腾，但若存在托盘任务也补一下
-        if (tray_task_exists_fast()) {
-            WCHAR trayFile[MAX_PATH]=L""; get_task_tray_file_path(trayFile, MAX_PATH);
-            if (!task_has_tray_flag_file(trayFile)) { WCHAR exe[MAX_PATH]=L""; GetModuleFileNameW(NULL, exe, MAX_PATH); if(exe[0]) task_create_internal(TASK_TRAY_NAME, exe, false); }
+        // 主任务读不到：不猜。旧实现把"读不到"当成"已带 --tray"，
+        // 于是从读不到任务的旧版升级上来的机器，开机弹主窗口的问题
+        // 在新版上依然存在，而且没有任何日志能说明原因。
+        if (GetLastError() != ERROR_FILE_NOT_FOUND && GetLastError() != ERROR_PATH_NOT_FOUND)
+            LOG_DEBUG("startup task file unreadable; skip migration probe");
+        return;
+    }
+    if (task_has_tray_flag_file(tf)) {
+        // 已经是新格式：顺手给托盘伴随任务也补一次（它可能还是旧的无 --tray 版本）
+        WCHAR trayFile[MAX_PATH]=L""; get_task_tray_file_path(trayFile, MAX_PATH);
+        if (GetFileAttributesW(trayFile)!=INVALID_FILE_ATTRIBUTES
+            && !task_has_tray_flag_file(trayFile) && !startup_migration_done()) {
+            WCHAR exe[MAX_PATH]=L""; GetModuleFileNameW(NULL, exe, MAX_PATH);
+            if (exe[0]) task_create_internal(TASK_TRAY_NAME, exe, false);
         }
         return;
     }
-    if (!task_has_tray_flag_file(tf)) task_create();
-    // 托盘任务也补齐
-    WCHAR trayFile[MAX_PATH]=L""; get_task_tray_file_path(trayFile, MAX_PATH);
-    if (GetFileAttributesW(trayFile)!=INVALID_FILE_ATTRIBUTES) {
-        if (!task_has_tray_flag_file(trayFile)) { WCHAR exe[MAX_PATH]=L""; GetModuleFileNameW(NULL, exe, MAX_PATH); if(exe[0]) task_create_internal(TASK_TRAY_NAME, exe, false); }
+    if (startup_migration_done()) return;   // 试过了，别再弹 UAC
+    LOG_INFO("legacy startup task lacks --tray; migrating");
+    if (task_create()) {
+        startup_mark_migrated();
+        LOG_INFO("startup task migrated to --tray");
+    } else {
+        /* 迁移失败（最常见：标准用户无法提权创建 ONLOGON/HIGHEST 任务）。
+           仍然打标，避免每次登录重复尝试；task_create 内部会退化写
+           HKCU\Run，自启本身还是能生效，只是没有提权。 */
+        startup_mark_migrated();
+        LOG_WARN("startup task migration failed; registry fallback used, will not retry this logon");
     }
 }
 

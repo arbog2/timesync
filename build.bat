@@ -69,18 +69,18 @@ if defined RC_EXE (
 
 echo [build] compiling sources...
 "%CL_EXE%" %CFLAGS% /I"%SDKINC%\um" /I"%SDKINC%\shared" /I"%SDKINC%\ucrt" /I"%VSDIR%\VC\Tools\MSVC\%MTOOLS%\include" ^
-  /c src\util.c src\config.c src\config_extra.c src\ntp.c src\timeset.c src\service.c src\task.c src\auth.c src\startup.c src\ntpserver.c src\window.c src\main.c
+  /c src\util.c src\config.c src\config_extra.c src\ntp.c src\timeset.c src\service.c src\task.c src\auth.c src\startup.c src\ntpserver.c src\watermark.c src\window.c src\main.c
 if errorlevel 1 goto :fail
 
 if defined RC_EXE (
   "%LINK_EXE%" %LFLAGS% /LIBPATH:"%SDKLIB%" /LIBPATH:"%SDKROOT%\Lib\%SDKVER%\ucrt\x64" ^
     /LIBPATH:"%VSDIR%\VC\Tools\MSVC\%MTOOLS%\lib\x64" ^
-    util.obj config.obj config_extra.obj ntp.obj timeset.obj service.obj task.obj auth.obj startup.obj ntpserver.obj window.obj main.obj resource.res ^
+    util.obj config.obj config_extra.obj ntp.obj timeset.obj service.obj task.obj auth.obj startup.obj ntpserver.obj watermark.obj window.obj main.obj resource.res ^
     /OUT:"%OUT%\timesync_new.exe" %LIBS%
 ) else (
   "%LINK_EXE%" %LFLAGS% /LIBPATH:"%SDKLIB%" /LIBPATH:"%SDKROOT%\Lib\%SDKVER%\ucrt\x64" ^
     /LIBPATH:"%VSDIR%\VC\Tools\MSVC\%MTOOLS%\lib\x64" ^
-    util.obj config.obj config_extra.obj ntp.obj timeset.obj service.obj task.obj auth.obj startup.obj ntpserver.obj window.obj main.obj ^
+    util.obj config.obj config_extra.obj ntp.obj timeset.obj service.obj task.obj auth.obj startup.obj ntpserver.obj watermark.obj window.obj main.obj ^
     /OUT:"%OUT%\timesync_new.exe" %LIBS%
 )
 if errorlevel 1 goto :fail
