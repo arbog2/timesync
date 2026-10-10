@@ -22,6 +22,7 @@
 #include "service.h"
 #include "ntpserver.h"
 #include "watermark.h"
+#include "cguard.h"
 
 // ---- 内部状态 ----
 static config_t*     s_cfg = NULL;
@@ -697,6 +698,9 @@ static bool ui_save_to_cfg(HWND hwnd) {
     }
     // 若启用日志则重建日志句柄
     util_log_init(s_cfg->log_enabled ? s_cfg->log_file : NULL, s_cfg->log_level);
+    /* 告诉配置守卫"这是用户主动保存的"：取消宽限观察并把当前文件设为基线。
+       否则老师刚改的配置可能在 3 分钟后被守卫当成"外部篡改"回滚掉。 */
+    cguard_note_saved(s_cfgPath);
     LOG_INFO("config saved via GUI to %s", s_cfgPath);
     return true;
 }
@@ -1392,7 +1396,16 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
             return 0;
         }
         case WM_TIMER:
-            if (wp==TIMER_STATUS) { refresh_status(hwnd); refresh_service_status(hwnd); }
+            if (wp==TIMER_STATUS) {
+                /* 配置在程序外被改过（记事本/被篡改后恢复）：重填控件。
+                   不这么做，界面还显示旧值——用户看不到自己改动的效果，
+                   之后点"保存"还会把旧值写回去覆盖掉。 */
+                if (cguard_take_ui_reload()) {
+                    ui_load_from_cfg(hwnd);
+                    autostart_invalidate();
+                }
+                refresh_status(hwnd); refresh_service_status(hwnd);
+            }
             else if (wp==TIMER_TRAY_RETRY) {
                 if (s_trayAdded) KillTimer(hwnd, TIMER_TRAY_RETRY);
                 else if (tray_add(hwnd)) KillTimer(hwnd, TIMER_TRAY_RETRY);

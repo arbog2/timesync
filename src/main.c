@@ -15,6 +15,7 @@
 #include "startup.h"
 #include "ntpserver.h"
 #include "watermark.h"
+#include "cguard.h"
 
 static config_t     g_cfg;
 static char         g_cfgPath[MAX_PATH] = "";
@@ -48,6 +49,8 @@ static DWORD WINAPI service_worker(LPVOID p) {
 
 void service_on_run(void) {
     LOG_INFO("service mode running");
+    /* 服务同样要防配置被篡改：Session 0 里的服务才是真正持续校时的那一个 */
+    cguard_init(g_cfgPath, &g_cfg);
     HANDLE th = CreateThread(NULL, 0, service_worker, NULL, 0, NULL);
     if (!th) {
         LOG_ERROR("CreateThread failed err=%lu", GetLastError());
@@ -76,6 +79,10 @@ static DWORD WINAPI tray_worker(LPVOID p) {
 
 static int run_as_tray(bool start_hidden) {
     LOG_INFO("GUI mode running (cfg=%s, hidden=%d)", g_cfgPath, start_hidden);
+
+    /* 配置守卫要先于 worker 起来：worker 的 cguard_tick 依赖这里的基线，
+       而"同步成功后固化 lastgood"要求此刻已有 lastgood 目录信息。 */
+    cguard_init(g_cfgPath, &g_cfg);
 
     HANDLE th = CreateThread(NULL, 0, tray_worker, NULL, 0, NULL);
     if (!th) { LOG_ERROR("worker create failed"); return 1; }

@@ -2,6 +2,7 @@
 #include "ntp.h"
 #include "timeset.h"
 #include "util.h"
+#include "cguard.h"
 #include "service.h"
 #include <stdio.h>
 #include <stdarg.h>
@@ -70,10 +71,12 @@ bool task_sync_once_c(const config_t* cfg, task_state_t* st, task_cancel_fn canc
     ntp_result_t r;
     int rc = ntp_sync_best(cfg->server, cfg->port, cfg->timeout_ms, 3, cancel, &r);
     if (rc == NTP_ERR_CANCELLED) {
+        st->last_server_ok = FALSE;
         LOG_INFO("sync cancelled during sampling");
         return false;   /* 不算失败：调用方要的是"尽快收手"，不重试、不刷错误 */
     }
     if (rc != 0) {
+        st->last_server_ok = FALSE;
         const char* why = (rc == -2)  ? "timeout"
                         : (rc == -3)  ? "short reply"
                         : (rc == -4)  ? "resolve failed"
@@ -90,6 +93,10 @@ bool task_sync_once_c(const config_t* cfg, task_state_t* st, task_cancel_fn canc
     }
     InterlockedExchange64(&st->last_offset_ms, r.offset_ms);
     InterlockedExchange64(&st->last_rtt_ms,    r.rtt_ms);
+    /* 服务器正常应答 = 这份配置里的 server/port 是对的。
+       注意这跟"时钟改没改成功"是两件事：未提权时改时钟必然失败，
+       但那不影响配置本身的有效性。配置守卫靠这个判断改动该不该回滚。 */
+    st->last_server_ok = TRUE;
     LOG_INFO("offset=%lld ms  rtt=%lld ms  stratum=%u",
              (long long)r.offset_ms, (long long)r.rtt_ms, r.stratum);
 
@@ -179,7 +186,7 @@ bool task_sync_once(const config_t* cfg, task_state_t* st) {
    worker 每秒在读），其中"重载配置"还是整结构体赋值 *s_cfg = tmp，
    可能读到新旧字段混合的配置。每轮开头在锁内拷一份快照到栈上再使用，
    锁内只有一次内存拷贝、没有 IO，耗时微秒级。 */
-void task_run(const config_t* cfg, task_state_t* st) {
+void task_run(config_t* cfg, task_state_t* st) {
     config_t first_snap;
     util_state_lock();
     first_snap = *cfg;
@@ -222,6 +229,9 @@ void task_run(const config_t* cfg, task_state_t* st) {
                必须用返回后的时间重新计算下一次计划，否则周期会短掉
                整个请求耗时（stale `now`）。 */
             int64_t done = (int64_t)time(NULL);
+            /* 守卫的依据是"服务器有没有正常应答"，不是同步整体成败：
+               未提权时改时钟必然失败，但配置本身没问题，不该因此回滚。 */
+            bool srvOk = InterlockedCompareExchange(&st->last_server_ok, FALSE, FALSE) != FALSE;
             if (ok) {
                 next_sync  = done + (int64_t)snap.interval_minutes * 60;
                 next_retry = INT64_MAX;
@@ -229,8 +239,36 @@ void task_run(const config_t* cfg, task_state_t* st) {
                 next_retry = done + snap.retry_seconds;
                 if (next_sync < done) next_sync = done + (int64_t)snap.interval_minutes * 60;
             }
+            if (srvOk) cguard_note_success(&snap);
+            else       cguard_note_failure();
         }
-        Sleep(1000);
-    }
+
+        /* 配置完整性守卫：只在这里跑（worker 线程），不阻塞 UI。
+           内部自带 30 秒节流，每轮开销只是一次 GetFileAttributes。
+
+           CGUARD_LOAD / CGUARD_RESTORED 都表示"配置文件变了，必须重新加载"——
+           只判磁盘文件而不更新内存的话，worker 会一直拿旧配置同步，
+           等于没防住（外部改了 server，实际还在连旧服务器）。 */
+        char cgPath[MAX_PATH] = "";
+        cguard_result_t cg = cguard_tick(cfg, cgPath, sizeof(cgPath));
+        if (cg != CGUARD_NONE && cgPath[0]) {
+            config_t fresh;
+            if (config_load(&fresh, cgPath)) {
+                util_state_lock();
+                *cfg = fresh;
+                util_state_unlock();
+                if (cg == CGUARD_RESTORED)
+                    LOG_INFO("config reloaded after tamper restore: %s", cgPath);
+                else
+                    LOG_INFO("config reloaded from external change: %s", cgPath);
+                /* 立即同步一次：用新配置验证它到底能不能用。
+                   宽限期（3 分钟）远短于默认同步周期（60 分钟），
+                   不催这一把，新配置在窗口内压根没机会被验证。 */
+                task_request_sync();
+            } else {
+                LOG_WARN("changed config failed to reload: %s", cgPath);
+            }
+        }
+        Sleep(1000);    }
     LOG_INFO("sync worker stopped");
 }

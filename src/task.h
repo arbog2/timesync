@@ -15,6 +15,10 @@ typedef struct {
     volatile LONG  synced_count;
     volatile LONG  failed_count;
     volatile BOOL  last_success;
+    /* 服务器是否正常应答过（SNTP 交互成功）。与 last_success 分开：
+       未提权时 SetSystemTime 必然失败（last_success=false），但 server 本身
+       是好的。配置守卫据此判断"这份配置该不该被回滚"，不能拿 last_success 代替。 */
+    volatile BOOL  last_server_ok;
     char           last_error[256];
 } task_state_t;
 
@@ -34,7 +38,11 @@ bool task_sync_once_c(const config_t* cfg, task_state_t* st, task_cancel_fn canc
 bool task_sync_once(const config_t* cfg, task_state_t* st);
 
 /* infinite scheduling loop. run until service_is_stopping() (service stop
-   flag is also what tray mode sets on Exit). */
-void task_run(const config_t* cfg, task_state_t* st);
+   flag is also what tray mode sets on Exit).
+
+   cfg 是可写的：除了每轮读快照喂给同步，还会在配置被外部篡改、
+   由 cguard 恢复之后把新配置写回它——否则本进程会继续用那份被篡改的配置
+   校时，直到重启才纠正，等于没防住。UI 线程对它的写入同样走 util_state_lock。 */
+void task_run(config_t* cfg, task_state_t* st);
 
 #endif /* TASK_H */
