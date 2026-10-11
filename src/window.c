@@ -431,8 +431,8 @@ static void do_sync_now_gui(HWND hwnd) {
 }
 
 /* 轮询提权子进程写回的结果文件。就绪后把 offset/rtt/成功标志灌进共享的
-   task_state，界面上"偏移/RTT/上次同步/状态"随之刷新，并弹一次框把
-   结果直接摆到用户眼前（此前这段信息在非提权路径下彻底无处可看）。 */
+   task_state，界面上"偏移/RTT/上次同步/状态"随之刷新。
+   注意：此处不再弹任何对话框——结果只落在界面状态栏上。 */
 static void poll_once_result(HWND hwnd) {
     if (!s_onceResult[0]) return;
     if (++s_onceTries > ONCE_RESULT_MAX_TRIES) {
@@ -440,7 +440,6 @@ static void poll_once_result(HWND hwnd) {
         DeleteFileW(s_onceResult);
         s_onceResult[0] = L'\0';
         SetWindowTextW(GetDlgItem(hwnd, IDC_LABEL_STATUS), L"提权同步超时：未收到子进程结果。");
-        show_err(L"提权同步在 30 秒内没有返回结果。\n请确认 UAC 已通过，必要时查看日志。", L"提权同步");
         return;
     }
 
@@ -497,16 +496,6 @@ static void poll_once_result(HWND hwnd) {
     util_state_unlock();
     s_state->last_success = ok ? TRUE : FALSE;
     refresh_status(hwnd);
-
-    WCHAR msg[512], werr[256];
-    utf8_to_w(err[0] ? err : "-", werr, 256);
-    if (ok) {
-        _snwprintf(msg, 512, L"同步成功。\n\n偏移：%lld ms\nRTT：%lld ms", off, rtt);
-        show_info(msg, L"立即同步");
-    } else {
-        _snwprintf(msg, 512, L"同步失败。\n\n原因：%s\n\n偏移：%lld ms\nRTT：%lld ms", werr, off, rtt);
-        show_err(msg, L"立即同步");
-    }
 }
 
 // ---- 托盘 ----
