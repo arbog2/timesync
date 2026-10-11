@@ -266,6 +266,12 @@ static bool tray_task_ensure(void) {
 }
 static void tray_task_remove(void) { task_delete_one(TASK_TRAY_NAME); }
 
+/* 托盘伴随任务是否已存在。只读任务文件属性、不打 schtasks，调用成本接近
+   一次系统调用，所以能放在看门狗每轮的循环里。 */
+bool startup_tray_task_exists(void) {
+    return tray_task_exists_fast();
+}
+
 // 任务文件为 UTF-16 XML，直接在字节流里搜索 "--tray/--startup/--hidden" 的
 // ASCII 与 UTF-16LE 两种编码，避免引入 XML 解析。
 static bool task_has_tray_flag_file(const WCHAR *taskFile) {

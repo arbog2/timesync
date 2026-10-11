@@ -56,7 +56,7 @@ REM Windows 7 SP1 target: 0x0601 = Win7 RTM/SP1, NTDDI 0x06010000.
 REM /SUBSYSTEM:WINDOWS,6.01 + /OSVERSION:6.1 set the PE minimum OS fields.
 set CFLAGS=/nologo /O1 /MT /W3 /utf-8 /D_CRT_SECURE_NO_WARNINGS /DWIN32_LEAN_AND_MEAN /D_WINSOCK_DEPRECATED_NO_WARNINGS /D_WIN32_WINNT=0x0601 /DWINVER=0x0601 /DNTDDI_VERSION=0x06010000
 set LFLAGS=/nologo /OPT:REF /OPT:ICF /SUBSYSTEM:WINDOWS,6.01 /OSVERSION:6.1 /ENTRY:mainCRTStartup
-set LIBS=kernel32.lib user32.lib gdi32.lib advapi32.lib shell32.lib ws2_32.lib ntdll.lib ole32.lib comctl32.lib comdlg32.lib bcrypt.lib
+set LIBS=kernel32.lib user32.lib gdi32.lib advapi32.lib shell32.lib ws2_32.lib ntdll.lib ole32.lib comctl32.lib comdlg32.lib bcrypt.lib wtsapi32.lib userenv.lib
 
 echo [build] toolset %MTOOLS%  SDK %SDKVER%  arch x64
 
@@ -69,18 +69,18 @@ if defined RC_EXE (
 
 echo [build] compiling sources...
 "%CL_EXE%" %CFLAGS% /I"%SDKINC%\um" /I"%SDKINC%\shared" /I"%SDKINC%\ucrt" /I"%VSDIR%\VC\Tools\MSVC\%MTOOLS%\include" ^
-  /c src\util.c src\config.c src\config_extra.c src\ntp.c src\timeset.c src\service.c src\task.c src\auth.c src\startup.c src\ntpserver.c src\watermark.c src\cguard.c src\window.c src\main.c
+  /c src\util.c src\config.c src\config_extra.c src\ntp.c src\timeset.c src\service.c src\task.c src\auth.c src\startup.c src\ntpserver.c src\watermark.c src\cguard.c src\trayguard.c src\window.c src\main.c
 if errorlevel 1 goto :fail
 
 if defined RC_EXE (
   "%LINK_EXE%" %LFLAGS% /LIBPATH:"%SDKLIB%" /LIBPATH:"%SDKROOT%\Lib\%SDKVER%\ucrt\x64" ^
     /LIBPATH:"%VSDIR%\VC\Tools\MSVC\%MTOOLS%\lib\x64" ^
-    util.obj config.obj config_extra.obj ntp.obj timeset.obj service.obj task.obj auth.obj startup.obj ntpserver.obj watermark.obj cguard.obj window.obj main.obj resource.res ^
+    util.obj config.obj config_extra.obj ntp.obj timeset.obj service.obj task.obj auth.obj startup.obj ntpserver.obj watermark.obj cguard.obj trayguard.obj window.obj main.obj resource.res ^
     /OUT:"%OUT%\timesync_new.exe" %LIBS%
 ) else (
   "%LINK_EXE%" %LFLAGS% /LIBPATH:"%SDKLIB%" /LIBPATH:"%SDKROOT%\Lib\%SDKVER%\ucrt\x64" ^
     /LIBPATH:"%VSDIR%\VC\Tools\MSVC\%MTOOLS%\lib\x64" ^
-    util.obj config.obj config_extra.obj ntp.obj timeset.obj service.obj task.obj auth.obj startup.obj ntpserver.obj watermark.obj cguard.obj window.obj main.obj ^
+    util.obj config.obj config_extra.obj ntp.obj timeset.obj service.obj task.obj auth.obj startup.obj ntpserver.obj watermark.obj cguard.obj trayguard.obj window.obj main.obj ^
     /OUT:"%OUT%\timesync_new.exe" %LIBS%
 )
 if errorlevel 1 goto :fail

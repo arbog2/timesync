@@ -16,6 +16,7 @@
 #include "ntpserver.h"
 #include "watermark.h"
 #include "cguard.h"
+#include "trayguard.h"
 
 static config_t     g_cfg;
 static char         g_cfgPath[MAX_PATH] = "";
@@ -51,6 +52,9 @@ void service_on_run(void) {
     LOG_INFO("service mode running");
     /* 服务同样要防配置被篡改：Session 0 里的服务才是真正持续校时的那一个 */
     cguard_init(g_cfgPath, &g_cfg);
+    /* 反向看门狗：托盘进程（用户会话里那个）被杀时把它拉回来。
+       服务自己的失败恢复动作只保服务自己，这一层补上另一半。 */
+    trayguard_start();
     HANDLE th = CreateThread(NULL, 0, service_worker, NULL, 0, NULL);
     if (!th) {
         LOG_ERROR("CreateThread failed err=%lu", GetLastError());
@@ -66,6 +70,8 @@ void service_on_run(void) {
     if (!exited)
         LOG_ERROR("worker thread still running at stop deadline; exiting anyway");
     CloseHandle(th);
+    /* 服务要停了：看门狗一起收掉，否则它会在服务停止后继续重启托盘 */
+    trayguard_stop();
     LOG_INFO("service mode exiting");
 }
 
@@ -94,6 +100,10 @@ static int run_as_tray(bool start_hidden) {
         task_set_periodic(false);
         LOG_INFO("service is running; GUI periodic sync disabled, on-demand sync stays");
     }
+    /* 托盘正常起来了：清掉上次"自愿退出"的标记，让看门狗恢复看护。
+       顺序很重要——必须在任何可能被杀之前清，否则一次自愿退出会让
+       看门狗从此再也不管。 */
+    trayguard_clear_quit_mark();
 
     char exeDir[MAX_PATH] = "";
     GetModuleFileNameA(NULL, exeDir, sizeof(exeDir));

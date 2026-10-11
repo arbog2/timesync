@@ -23,6 +23,7 @@
 #include "ntpserver.h"
 #include "watermark.h"
 #include "cguard.h"
+#include "trayguard.h"
 
 // ---- 内部状态 ----
 static config_t*     s_cfg = NULL;
@@ -1323,6 +1324,12 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
                         // 所以这里只需 service_set_stopping()，主线程随后
                         // DestroyWindow -> PostQuitMessage 结束消息循环，
                         // main.c 的 run_as_tray 会等 worker 收尾。
+                        //
+                        // 先告诉服务侧看门狗"这是用户自己要退的"：否则服务
+                        // 会在几十秒后把托盘重新拉起来，用户点退出毫无效果，
+                        // 只会以为开关坏了。任务管理器结束进程不经过这里，
+                        // 所以被杀是可以被拉回的。
+                        trayguard_note_user_quit();
                         service_set_stopping();
                         DestroyWindow(hwnd);
                         break;

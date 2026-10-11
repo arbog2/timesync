@@ -11,6 +11,8 @@ bool startup_set(bool enable);
 void startup_ensure_tray_args(void);
 // 服务托盘伴随任务：服务本身跑在 Session 0 看不到图标，需额外一个 ONLOGON 托盘任务进桌面
 bool startup_tray_for_service(bool enable);
+// 托盘伴随任务是否已存在（只做文件属性探测，不 shell out，便宜到可以每轮调）
+bool startup_tray_task_exists(void);
 #ifdef __cplusplus
 }
 #endif
