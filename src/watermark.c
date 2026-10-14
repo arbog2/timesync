@@ -311,31 +311,50 @@ static LRESULT CALLBACK WmWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-/* 把水印窗口插入桌面窗口（Progman）正上方的 Z 序位置。
-   Progman 是所有顶层窗口里最靠下的一个（壁纸与桌面图标都画在它里面），
-   紧贴它上方 = 位于所有应用窗口之下、桌面之上。
+/* 把水印窗口放到桌面窗口（Progman）正上方的 Z 序位置。
+   Progman 是桌面（壁纸与桌面图标都画在它里面），紧贴它上方 =
+   位于所有应用窗口之下、桌面之上。
    不需要也不应该 SetParent：那样会把窗口变成子窗口，而 Win7 及更早对
-   子窗口调用 UpdateLayeredWindow 会失败（这正是 Win7 上水印消失的原因）。 */
-static void wm_place_desktop_zorder(void) {
-    if (!s_hwnd || !IsWindow(s_hwnd)) return;
+   子窗口调用 UpdateLayeredWindow 会失败（这正是 Win7 上水印消失的原因）。
+   返回是否已锚定成功；失败时保持普通层（绝不置顶），等 TaskbarCreated
+   或托盘重试时由 watermark_reanchor() 再试。 */
+static bool wm_place_desktop_zorder(void) {
+    if (!s_hwnd || !IsWindow(s_hwnd)) return false;
 
-    HWND desktop = FindWindowW(L"Progman", NULL);
-    if (desktop && IsWindow(desktop)) {
-        /* hWndInsertAfter 用桌面窗口本身：插入到它正上方。
-           SWP_NOACTIVATE 保持不变，绝不抢焦点。 */
-        SetWindowPos(s_hwnd, desktop, 0, 0, 0, 0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-        s_host = desktop;      /* 记下来，供 Explorer 重启后重新插入 */
-        return;
+    /* 先清掉可能残留的 TOPMOST 位：早期版本在 Explorer 未就绪时回退成置顶，
+       且之后不再清除，会永远盖在软件上。桌面模式下绝不能带这个位。 */
+    {
+        LONG_PTR ex = GetWindowLongPtrW(s_hwnd, GWL_EXSTYLE);
+        if (ex & WS_EX_TOPMOST) {
+            SetWindowLongPtrW(s_hwnd, GWL_EXSTYLE, ex & ~WS_EX_TOPMOST);
+            /* 去位后必须用 NOTOPMOST 生效一次；紧接着下面还会再插到
+               Progman 上方，最终仍是桌面正上方，不会闪到最前。 */
+            SetWindowPos(s_hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
     }
 
-    /* 拿不到桌面对话（Explorer 未就绪/已崩溃）：退回置顶，至少看得见 */
-    LOG_WARN("desktop window not found; watermark falls back to topmost");
-    SetWindowLongPtrW(s_hwnd, GWL_EXSTYLE,
-                      (LONG_PTR)(GetWindowLongPtrW(s_hwnd, GWL_EXSTYLE) | WS_EX_TOPMOST));
-    SetWindowPos(s_hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    HWND desktop = FindWindowW(L"Progman", NULL);
+    if ((!desktop || !IsWindow(desktop)))
+        desktop = FindWindowW(L"Progman", L"Program Manager");
+    if (desktop && IsWindow(desktop)) {
+        /* hWndInsertAfter 用桌面窗口本身：放到它正上方（实测该调用是
+           “放到锚点之上”，正好是桌面正上方、所有应用之下）。
+           SWP_NOACTIVATE 绝不抢焦点；SWP_SHOWWINDOW 一次到位，
+           调用方切勿在此之后再调 ShowWindow，否则会重新提到顶部。 */
+        SetWindowPos(s_hwnd, desktop, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        s_host = desktop;      /* 记下来，供 Explorer 重启后重新锚定 */
+        return true;
+    }
+
+    /* Explorer 未就绪/已崩溃：保持普通层并藏到最底，绝不回退成置顶。
+       新窗口只会盖在它上面，不会被它盖住；等桌面建好后重锚回来即可。 */
+    LOG_WARN("desktop window not found; watermark stays at bottom, will retry when shell ready");
+    SetWindowPos(s_hwnd, HWND_BOTTOM, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
     s_host = NULL;
+    return false;
 }
 
 static bool wm_create_window(HINSTANCE hInst) {
@@ -362,8 +381,7 @@ static bool wm_create_window(HINSTANCE hInst) {
     }
 
     /* 基础样式：分层(逐像素 alpha) + 点击穿透 + 不进任务栏/Alt+Tab + 不抢焦点。
-       水位(TOPMOST)不在这里决定：贴桌面模式下不能有它，
-       只在 layer=top 或附着失败回退时才加。 */
+       水位(TOPMOST)只在 layer=top 时才加，贴桌面模式永远不加。 */
     DWORD exStyle = WS_EX_LAYERED | WS_EX_TRANSPARENT
                   | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
     if (s_onTop) exStyle |= WS_EX_TOPMOST;
@@ -391,14 +409,19 @@ static bool wm_create_window(HINSTANCE hInst) {
     if (!s_onTop) {
         /* 贴桌面：插到 Progman 正上方，位于所有应用窗口之下。
            注意不能用 SetParent 做到这一点——那会让本窗口变成子窗口，
-           而 Win7 及更早对子窗口调用 UpdateLayeredWindow 会失败。 */
+           而 Win7 及更早对子窗口调用 UpdateLayeredWindow 会失败。
+           wm_place 内部已用 SWP_SHOWWINDOW 一次到位，切勿在此之后再调
+           ShowWindow：那会把刚压到桌面上方的窗口重新提到普通层顶部，
+           盖在已打开的软件上。 */
         wm_place_desktop_zorder();
         LOG_INFO("watermark placed above desktop window (host=%p)",
                  (void*)s_host);
+        /* layer=top 时样式里已带 WS_EX_TOPMOST，这里才需要显示 */
+    } else {
+        /* layer=top 时样式里已带 WS_EX_TOPMOST，不需额外处理 */
+        ShowWindow(h, SW_SHOWNOACTIVATE);
     }
-    /* layer=top 时样式里已带 WS_EX_TOPMOST，不需额外处理 */
 
-    ShowWindow(h, SW_SHOWNOACTIVATE);
     s_active = true;
     return true;
 }
@@ -409,15 +432,38 @@ static bool wm_create_window(HINSTANCE hInst) {
 
 void watermark_destroy(void) {
     if (s_hwnd && IsWindow(s_hwnd)) {
-        /* DestroyWindow 会走到 WM_DESTROY，那里回收字体和句柄。
-           附着在桌面宿主上时，DestroyWindow 自身也会把它从宿主的子窗口
-           链表里摘掉，不用先 SetParent 回桌面。 */
+        /* 本窗口是顶层窗口（从未 SetParent），Explorer 重启不会销毁它，
+           这里只是常规销毁。 */
         DestroyWindow(s_hwnd);
     }
     s_hwnd   = NULL;
     s_host   = NULL;
     s_active = false;
     wm_drop_font();
+}
+
+/* 桌面模式下的重锚定：供 TaskbarCreated 与托盘重试定时器调用。
+   - 启动时 Explorer 未就绪（s_host==NULL）时稍后重试，回到桌面正上方；
+   - 残留 TOPMOST 位（老版本回退上来的一直置顶）顺手清除；
+   - 已锚定且宿主还在时一般不动，避免无谓闪动。 */
+void watermark_reanchor(void) {
+    if (s_onTop) return;   /* 置顶模式不需要锚定 */
+    if (!s_hwnd || !IsWindow(s_hwnd)) return;
+    if (s_host && IsWindow(s_host)) {
+        LONG_PTR ex = GetWindowLongPtrW(s_hwnd, GWL_EXSTYLE);
+        if (ex & WS_EX_TOPMOST) {
+            LOG_INFO("watermark had stale TOPMOST bit; pushing back to desktop");
+            wm_place_desktop_zorder();
+        }
+        return;
+    }
+    /* 未锚定或宿主已死（Explorer 重启后 Progman 句柄会换）：顶层窗口本身
+       不会被 Explorer 连带销毁，直接重锚即可，不必重建闪一下。 */
+    if (s_host && !IsWindow(s_host))
+        LOG_INFO("desktop window recreated (explorer restarted?); reanchoring");
+    s_host = NULL;
+    wm_paint();
+    wm_place_desktop_zorder();
 }
 
 bool watermark_apply(HINSTANCE hInst, const config_t* cfg) {
@@ -447,19 +493,29 @@ bool watermark_apply(HINSTANCE hInst, const config_t* cfg) {
         return false;
     }
 
-    /* 宿主可能已经没了：Explorer 重启会连带销毁挂在它下面的水印窗口
-       （父窗口销毁时子窗口一并销毁），此时 s_hwnd 指向一个失效句柄。
-       先把这类残留清掉，后面的分支会重新创建。 */
+    /* 本窗口是顶层窗口（从未 SetParent），Explorer 重启不会销毁它；
+       只是 Progman 句柄会换，需要重锚。窗口句柄本身失效时才重建。 */
     const bool wantOnTop = cfg->watermark_on_top;
-    if (s_hwnd && (!IsWindow(s_hwnd) || (s_host && !IsWindow(s_host)))) {
-        LOG_INFO("watermark parent gone (explorer restarted?); recreating");
+    if (s_hwnd && !IsWindow(s_hwnd)) {
+        LOG_INFO("watermark window gone; recreating");
         watermark_destroy();
     }
 
     if (s_hwnd && IsWindow(s_hwnd)) {
-        /* 已存在：层级变了要重建（样式/父子关系不能就地改），
-           其余情况按新参数重画即可。 */
-        if (wantOnTop == s_onTop) return wm_paint();
+        /* 已存在：层级变了要重建（TOPMOST 位不能就地加减到完全等价），
+           其余情况按新参数重画即可。但桌面模式下若从未锚定成功
+           （开机时 Explorer 未就绪）或残留 TOPMOST 位，不能只重画，
+           必须顺手重锚，否则会永远盖在软件上。 */
+        if (wantOnTop == s_onTop) {
+            if (!wantOnTop &&
+                (!s_host || !IsWindow(s_host) ||
+                 (GetWindowLongPtrW(s_hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST))) {
+                bool ok = wm_paint();
+                wm_place_desktop_zorder();
+                return ok && IsWindow(s_hwnd);
+            }
+            return wm_paint();
+        }
         watermark_destroy();
     }
 

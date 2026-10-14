@@ -1247,10 +1247,11 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         s_trayAdded = FALSE;
         if (!tray_add(hwnd))
             SetTimer(hwnd, TIMER_TRAY_RETRY, TRAY_RETRY_MS, NULL);
-        /* 水印贴在桌面（Progman/WorkerW）下面，Explorer 重启会把宿主连同
-           我们的子窗口一起销毁，这里一并重建。watermark_apply 内部会先
-           识别失效句柄。 */
+        /* 水印是顶层窗口（从未 SetParent），Explorer 重启不会销毁它，
+           只是 Progman 句柄会换。这里重锚回桌面正上方即可；
+           watermark_apply 内部也会识别失效宿主并重锚。 */
         if (s_cfg) watermark_apply(GetModuleHandleW(NULL), s_cfg);
+        else watermark_reanchor();
         return 0;
     }
     if (s_msgShowWindow && msg == s_msgShowWindow) {
@@ -1405,7 +1406,10 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
             else if (wp==TIMER_TRAY_RETRY) {
                 if (s_trayAdded) KillTimer(hwnd, TIMER_TRAY_RETRY);
                 else if (tray_add(hwnd)) KillTimer(hwnd, TIMER_TRAY_RETRY);
-                /* 仍失败则保持定时器，下轮继续；tray_add 内已记 warn */
+                /* 仍失败则保持定时器，下轮继续；tray_add 内已记 warn。
+                   开机时 Explorer 未就绪会导致水印暂时锚定失败（藏在最底），
+                   在托盘重试的同时顺手重锚，桌面建好后自动回到桌面正上方。 */
+                watermark_reanchor();
             }
             else if (wp==TIMER_ONCE_RESULT) poll_once_result(hwnd);
             else if (wp==99) { KillTimer(hwnd, 99); refresh_service_status(hwnd); refresh_ntp_status(hwnd); }

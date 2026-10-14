@@ -13,7 +13,9 @@ extern "C" {
 
    实现要点（决定了它为什么"看得见但不碍事"）：
      - WS_EX_LAYERED + UpdateLayeredWindow：逐像素 alpha，文字边缘抗锯齿；
-     - WS_EX_TOPMOST：常驻所有窗口之上，包括最大化的窗口；
+     - 默认贴桌面：Z 序插到 Progman 正上方，位于所有应用窗口之下、
+       桌面之上，只在桌面可见，不会盖在打开的软件上；
+       layer=top 时才加 WS_EX_TOPMOST 常驻所有窗口之上；
      - WS_EX_TRANSPARENT + WM_NCHITTEST 返回 HTTRANSPARENT：鼠标完全穿透，
        不会挡住右上角任何按钮的点击；
      - WS_EX_TOOLWINDOW：不进任务栏、不进 Alt+Tab；
@@ -30,6 +32,10 @@ void watermark_destroy(void);
 
 /* 强制重画（分辨率/工作区变化、机器名变化后调用）。 */
 void watermark_refresh(void);
+
+/* 桌面模式下的重锚定：Explorer 未就绪时创建的水印稍后回到桌面正上方，
+   并清除可能残留的 TOPMOST 位。供 TaskbarCreated 与托盘重试定时器调用。 */
+void watermark_reanchor(void);
 
 /* 当前水印窗口句柄；未显示时为 NULL。 */
 HWND watermark_hwnd(void);
